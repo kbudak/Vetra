@@ -5,6 +5,7 @@ class ShellTaskbar {
     bool guarded = false;
     bool autohideApplied = false;
     UINT originalState = 0;
+    HANDLE cancelWatchdog{};
 public:
     ~ShellTaskbar();
     bool start(bool deferAutohide = false);
@@ -12,6 +13,7 @@ public:
     void hide(bool force = false) const;
     void revealPrimary() const;
     void restore();
+    void restoreIfOrphaned();
     void expandWorkArea(HMONITOR monitor, RECT& work) const;
     static bool runRestoreMode(const wchar_t* command);
 };

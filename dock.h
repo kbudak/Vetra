@@ -159,6 +159,8 @@ public:
     NativeFlyout nativeFlyout = NativeFlyout::None;
     bool nativeBarRevealed = false, nativeQuickOpen = false, volumeDrag = false;
     Box barVolumeCard{}, barVolumeTrack{}, quickVolumeTrack{}, opacitySliderTrack{};
+    Box statusVolumeHit{}, statusKeyboardHit{};
+    HWND lastExternalFg{};
     bool barVolumeDrag = false, barVolumeAnimating = false, opacitySliderDrag = false;
     float barVolumeLevel = -1.f, barVolumeTarget = -1.f, barVolumeSent = -1.f;
     double barVolumeTickMs = 0.0, barVolumeCommitMs = 0.0, barVolumePaintMs = 0.0, opacityPaintMs = 0.0;
@@ -505,6 +507,16 @@ public:
     bool mediaInUse() const;
     void sampleMicrophone(bool toggle = false);
     void microphonePanel(Palette p);
+    void refreshMicEndpoints();
+    void setMicEndpoint(const Text& deviceId);
+    void sampleKeyboardLayout();
+    void switchKeyboardLayout(HKL targetHkl);
+    void cycleKeyboardLayout(int delta);
+    void keyboardPanel(Palette p);
+    void sampleNetworkFast();
+    float statusBarWidth() const;
+    float trailingWidth() const;
+    void drawStatusBar(View& view, float x, Palette p);
     void drawQuickToggles(View& view, Box b, Palette p, bool preview, bool labels = false);
     void showAppMenu(Shortcut app, float x = -1, HWND window = nullptr, std::shared_ptr<Gdiplus::Bitmap> icon = {});
     void sizeAppMenu();

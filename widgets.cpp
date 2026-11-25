@@ -2,8 +2,10 @@
 #include <ws2ipdef.h>
 #include <iphlpapi.h>
 #include <endpointvolume.h>
+#include <audiopolicy.h>
 #include <mmdeviceapi.h>
 #include <powrprof.h>
+#include <shlwapi.h>
 #include <tlhelp32.h>
 #include <winhttp.h>
 #include <wlanapi.h>
@@ -825,21 +827,329 @@ static void audio(ExtraWidgets& e, int by, bool toggle, float setScalar = -1.f) 
         gAudioEndpoint.Reset();
     }
 }
+static Text friendlyProcessName(DWORD pid) {
+    if (!pid) return {};
+    HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!proc) return {};
+    wchar_t path[1024]{};
+    DWORD len = ARRAYSIZE(path);
+    Text name;
+    if (QueryFullProcessImageNameW(proc, 0, path, &len) && len > 0) {
+        name = leaf(Text(path, len));
+        const size_t dot = name.rfind(L'.');
+        if (dot != Text::npos) name.resize(dot);
+        if (!name.empty()) name[0] = static_cast<wchar_t>(std::towupper(name[0]));
+    }
+    CloseHandle(proc);
+    return name;
+}
+
 void Dock::sampleMicrophone(bool toggle) {
     extra.microphoneMute = -1;
+    extra.micDeviceName.clear();
+    extra.micActiveApps.clear();
     if (!gAudioEnum && FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_INPROC_SERVER,
         IID_PPV_ARGS(&gAudioEnum)))) return;
     ComPtr<IMMDevice> device;
     if (FAILED(gAudioEnum->GetDefaultAudioEndpoint(eCapture, eCommunications, &device)) &&
         FAILED(gAudioEnum->GetDefaultAudioEndpoint(eCapture, eConsole, &device))) return;
-    ComPtr<IAudioEndpointVolume> endpoint;
-    if (!device || FAILED(device->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL, nullptr,
-        reinterpret_cast<void**>(endpoint.GetAddressOf())))) return;
-    BOOL muted{};
-    if (FAILED(endpoint->GetMute(&muted))) return;
-    if (toggle && SUCCEEDED(endpoint->SetMute(!muted, nullptr))) endpoint->GetMute(&muted);
-    extra.microphoneMute = muted != FALSE;
+    if (device) {
+        extra.micDeviceName = endpointName(*device.Get());
+        ComPtr<IAudioEndpointVolume> endpoint;
+        if (SUCCEEDED(device->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL, nullptr,
+            reinterpret_cast<void**>(endpoint.GetAddressOf()))) && endpoint) {
+            BOOL muted{};
+            if (SUCCEEDED(endpoint->GetMute(&muted))) {
+                if (toggle && SUCCEEDED(endpoint->SetMute(!muted, nullptr))) endpoint->GetMute(&muted);
+                extra.microphoneMute = muted != FALSE;
+            }
+        }
+    }
+    // Enumerate active recording sessions across all active capture endpoints
+    ComPtr<IMMDeviceCollection> captures;
+    if (SUCCEEDED(gAudioEnum->EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE, &captures)) && captures) {
+        UINT devCount = 0;
+        captures->GetCount(&devCount);
+        for (UINT dIdx = 0; dIdx < devCount; ++dIdx) {
+            ComPtr<IMMDevice> capDev;
+            if (FAILED(captures->Item(dIdx, &capDev)) || !capDev) continue;
+            ComPtr<IAudioSessionManager2> mgr;
+            if (FAILED(capDev->Activate(__uuidof(IAudioSessionManager2), CLSCTX_ALL, nullptr,
+                reinterpret_cast<void**>(mgr.GetAddressOf()))) || !mgr) continue;
+            ComPtr<IAudioSessionEnumerator> sessEnum;
+            if (FAILED(mgr->GetSessionEnumerator(&sessEnum)) || !sessEnum) continue;
+            int sCount = 0;
+            sessEnum->GetCount(&sCount);
+            for (int sIdx = 0; sIdx < sCount; ++sIdx) {
+                ComPtr<IAudioSessionControl> ctrl;
+                if (FAILED(sessEnum->GetSession(sIdx, &ctrl)) || !ctrl) continue;
+                AudioSessionState state = AudioSessionStateInactive;
+                if (FAILED(ctrl->GetState(&state)) || state != AudioSessionStateActive) continue;
+                ComPtr<IAudioSessionControl2> ctrl2;
+                if (FAILED(ctrl.As(&ctrl2)) || !ctrl2) continue;
+                if (ctrl2->IsSystemSoundsSession() == S_OK) continue;
+                DWORD pid = 0;
+                ctrl2->GetProcessId(&pid);
+                Text appName = friendlyProcessName(pid);
+                if (appName.empty()) {
+                    LPWSTR disp{};
+                    if (SUCCEEDED(ctrl->GetDisplayName(&disp)) && disp) {
+                        if (*disp && disp[0] != L'@') appName = disp;
+                        CoTaskMemFree(disp);
+                    }
+                }
+                if (appName.empty()) appName = L"Uygulama";
+                if (std::none_of(extra.micActiveApps.begin(), extra.micActiveApps.end(), [&](const Text& existing) {
+                    return CompareStringOrdinal(existing.c_str(), -1, appName.c_str(), -1, TRUE) == CSTR_EQUAL;
+                })) {
+                    extra.micActiveApps.push_back(std::move(appName));
+                }
+            }
+        }
+    }
     if (toggle) { paintBar(); paintSheet(); }
+}
+
+void Dock::sampleNetworkFast() {
+    MIB_IF_TABLE2* table{};
+    if (GetIfTable2(&table) != NO_ERROR || !table) return;
+    bool eth = false, wifi = false;
+    for (ULONG i = 0; i < table->NumEntries; ++i) {
+        const auto& item = table->Table[i];
+        if (item.OperStatus != IfOperStatusUp ||
+            item.MediaConnectState != MediaConnectStateConnected ||
+            !item.InterfaceAndOperStatusFlags.HardwareInterface ||
+            item.Type == IF_TYPE_SOFTWARE_LOOPBACK || item.Type == IF_TYPE_TUNNEL ||
+            item.PhysicalMediumType == NdisPhysicalMediumBluetooth)
+            continue;
+        if (item.Type == IF_TYPE_ETHERNET_CSMACD) eth = true;
+        else if (item.Type == IF_TYPE_IEEE80211) wifi = true;
+    }
+    FreeMibTable(table);
+    extra.netEthernetFast = eth;
+    extra.netWifiFast = wifi;
+}
+
+namespace {
+struct LayoutRegCache {
+    std::unordered_map<Text, Text> byKlid;
+    std::unordered_map<WORD, Text> byLayoutId;
+    bool loaded = false;
+
+    void ensure() {
+        if (loaded) return;
+        loaded = true;
+        HKEY root{};
+        if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Control\\Keyboard Layouts",
+            0, KEY_READ, &root) != ERROR_SUCCESS) return;
+        wchar_t subName[64]{};
+        for (DWORD idx = 0; ; ++idx) {
+            DWORD subLen = ARRAYSIZE(subName);
+            if (RegEnumKeyExW(root, idx, subName, &subLen, nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS) break;
+            HKEY sub{};
+            if (RegOpenKeyExW(root, subName, 0, KEY_READ, &sub) != ERROR_SUCCESS) continue;
+            wchar_t dispBuf[256]{}, textBuf[256]{}, idBuf[32]{};
+            DWORD bytes = sizeof(dispBuf);
+            Text name;
+            if (RegGetValueW(sub, nullptr, L"Layout Display Name", RRF_RT_REG_SZ, nullptr, dispBuf, &bytes) == ERROR_SUCCESS && *dispBuf) {
+                wchar_t resolved[256]{};
+                if (SUCCEEDED(SHLoadIndirectString(dispBuf, resolved, ARRAYSIZE(resolved), nullptr)) && *resolved)
+                    name = resolved;
+            }
+            if (name.empty()) {
+                bytes = sizeof(textBuf);
+                if (RegGetValueW(sub, nullptr, L"Layout Text", RRF_RT_REG_SZ, nullptr, textBuf, &bytes) == ERROR_SUCCESS && *textBuf)
+                    name = textBuf;
+            }
+            if (!name.empty()) {
+                Text klid(subName);
+                for (auto& ch : klid) ch = static_cast<wchar_t>(std::towupper(ch));
+                byKlid[klid] = name;
+                bytes = sizeof(idBuf);
+                if (RegGetValueW(sub, nullptr, L"Layout Id", RRF_RT_REG_SZ, nullptr, idBuf, &bytes) == ERROR_SUCCESS && *idBuf) {
+                    const WORD lid = static_cast<WORD>(wcstoul(idBuf, nullptr, 16));
+                    if (lid) byLayoutId[lid] = name;
+                }
+            }
+            RegCloseKey(sub);
+        }
+        RegCloseKey(root);
+    }
+};
+
+LayoutRegCache gLayoutReg;
+
+Text resolveKeyboardLayoutName(LANGID langId, WORD deviceId) {
+    gLayoutReg.ensure();
+    if ((deviceId & 0xF000) == 0xF000) {
+        const WORD lid = deviceId & 0x0FFF;
+        if (auto it = gLayoutReg.byLayoutId.find(lid); it != gLayoutReg.byLayoutId.end()) return it->second;
+    }
+    wchar_t klid[16]{};
+    swprintf_s(klid, L"0000%04X", deviceId ? deviceId : langId);
+    if (auto it = gLayoutReg.byKlid.find(klid); it != gLayoutReg.byKlid.end()) return it->second;
+    swprintf_s(klid, L"0000%04X", langId);
+    if (auto it = gLayoutReg.byKlid.find(klid); it != gLayoutReg.byKlid.end()) return it->second;
+    return {};
+}
+
+Text deriveLayoutSubCode(const Text& layoutName, LANGID langId, WORD deviceId) {
+    if (deviceId == 0xF014 || layoutName.find(L" F") != Text::npos || layoutName.ends_with(L" F")) return L"F";
+    if (langId == 0x041F && (deviceId == 0x041F || layoutName.find(L" Q") != Text::npos || layoutName.ends_with(L" Q"))) return L"Q";
+    if (deviceId == 0x0409 || layoutName.find(L"US") != Text::npos || layoutName.find(L"ABD") != Text::npos) return L"US";
+    if (deviceId == 0x0809 || layoutName.find(L"UK") != Text::npos || layoutName.find(L"Birleşik Krallık") != Text::npos) return L"UK";
+    if (!layoutName.empty()) {
+        Text out;
+        for (wchar_t ch : layoutName) {
+            if (std::iswalnum(ch)) {
+                out.push_back(static_cast<wchar_t>(std::towupper(ch)));
+                if (out.size() == 2) break;
+            }
+        }
+        return out;
+    }
+    return {};
+}
+
+KeyboardLayoutInfo describeKeyboardHkl(HKL hkl, bool active) {
+    KeyboardLayoutInfo info;
+    info.hkl = hkl;
+    info.active = active;
+    const LANGID langId = LOWORD(reinterpret_cast<UINT_PTR>(hkl));
+    const WORD deviceId = HIWORD(reinterpret_cast<UINT_PTR>(hkl));
+    const LCID lcid = MAKELCID(langId, SORT_DEFAULT);
+    wchar_t buf[128]{};
+    if (GetLocaleInfoW(lcid, LOCALE_SISO639LANGNAME, buf, ARRAYSIZE(buf)) > 0) {
+        info.shortCode = buf;
+        for (auto& ch : info.shortCode) ch = static_cast<wchar_t>(std::towupper(ch));
+    }
+    if (info.shortCode.empty() && GetLocaleInfoW(lcid, LOCALE_SABBREVLANGNAME, buf, ARRAYSIZE(buf)) > 0) {
+        info.shortCode = buf;
+        if (info.shortCode.size() > 3) info.shortCode.resize(3);
+    }
+    if (info.shortCode.empty()) info.shortCode = L"KB";
+    if (GetLocaleInfoW(lcid, LOCALE_SLOCALIZEDDISPLAYNAME, buf, ARRAYSIZE(buf)) > 0) info.languageName = buf;
+    else if (GetLocaleInfoW(lcid, LOCALE_SLOCALIZEDLANGUAGENAME, buf, ARRAYSIZE(buf)) > 0) info.languageName = buf;
+    else info.languageName = info.shortCode;
+    info.layoutName = resolveKeyboardLayoutName(langId, deviceId);
+    if (info.layoutName.empty()) info.layoutName = info.languageName;
+    info.subCode = deriveLayoutSubCode(info.layoutName, langId, deviceId);
+    return info;
+}
+
+HWND resolveInputTargetWindow(HWND fg) {
+    if (!fg || !IsWindow(fg)) return nullptr;
+    wchar_t cls[64]{};
+    if (GetClassNameW(fg, cls, ARRAYSIZE(cls)) && wcscmp(cls, L"ApplicationFrameWindow") == 0) {
+        if (HWND core = FindWindowExW(fg, nullptr, L"Windows.UI.Core.CoreWindow", nullptr))
+            return core;
+    }
+    return fg;
+}
+}
+
+void Dock::sampleKeyboardLayout() {
+    const HWND fg = GetForegroundWindow();
+    if (fg && IsWindow(fg)) {
+        DWORD pid = 0;
+        GetWindowThreadProcessId(fg, &pid);
+        if (pid && pid != GetCurrentProcessId()) lastExternalFg = fg;
+    }
+    HWND source = (lastExternalFg && IsWindow(lastExternalFg)) ? lastExternalFg : fg;
+    HWND target = resolveInputTargetWindow(source);
+    DWORD tid = target ? GetWindowThreadProcessId(target, nullptr) : 0;
+    HKL current = tid ? GetKeyboardLayout(tid) : nullptr;
+    if (!current) current = GetKeyboardLayout(0);
+
+    const int count = GetKeyboardLayoutList(0, nullptr);
+    std::vector<HKL> rawList(count > 0 ? count : 0);
+    if (count > 0) GetKeyboardLayoutList(count, rawList.data());
+    if (current && std::find(rawList.begin(), rawList.end(), current) == rawList.end())
+        rawList.insert(rawList.begin(), current);
+
+    std::vector<KeyboardLayoutInfo> layouts;
+    layouts.reserve(rawList.size());
+    std::unordered_map<Text, int> shortCounts;
+    for (HKL hkl : rawList) {
+        if (!hkl) continue;
+        auto info = describeKeyboardHkl(hkl, hkl == current);
+        ++shortCounts[info.shortCode];
+        layouts.push_back(std::move(info));
+    }
+    Text activeShort = L"KB", activeSub;
+    for (auto& item : layouts) {
+        if (shortCounts[item.shortCode] <= 1) item.subCode.clear();
+        if (item.active) {
+            activeShort = item.shortCode;
+            activeSub = item.subCode;
+        }
+    }
+    extra.keyboardLayouts = std::move(layouts);
+    extra.activeKeyboardHkl = current;
+    extra.keyboardShort = std::move(activeShort);
+    extra.keyboardSub = std::move(activeSub);
+}
+
+void Dock::switchKeyboardLayout(HKL targetHkl) {
+    if (!targetHkl) return;
+    if (panel && page == KeyboardLang) closeSheet();
+    HWND source = (lastExternalFg && IsWindow(lastExternalFg)) ? lastExternalFg : GetForegroundWindow();
+    HWND target = resolveInputTargetWindow(source);
+    bool posted = false;
+    bool accessDenied = false;
+    if (target && IsWindow(target)) {
+        const DWORD tid = GetWindowThreadProcessId(target, nullptr);
+        GUITHREADINFO gui{sizeof(gui)};
+        HWND focusWin = (tid && GetGUIThreadInfo(tid, &gui) && gui.hwndFocus && IsWindow(gui.hwndFocus))
+            ? gui.hwndFocus : nullptr;
+        if (focusWin) {
+            SetLastError(0);
+            if (PostMessageW(focusWin, WM_INPUTLANGCHANGEREQUEST, 0, reinterpret_cast<LPARAM>(targetHkl)))
+                posted = true;
+            else if (GetLastError() == ERROR_ACCESS_DENIED) accessDenied = true;
+        }
+        if (target != focusWin) {
+            SetLastError(0);
+            if (PostMessageW(target, WM_INPUTLANGCHANGEREQUEST, 0, reinterpret_cast<LPARAM>(targetHkl)))
+                posted = true;
+            else if (GetLastError() == ERROR_ACCESS_DENIED) accessDenied = true;
+        }
+    }
+    ActivateKeyboardLayout(targetHkl, KLF_SETFORPROCESS);
+    if (!posted && accessDenied) {
+        // Elevated foreground window blocks WM_INPUTLANGCHANGEREQUEST via UIPI; trigger Windows Win+Space switcher.
+        INPUT keys[4]{};
+        for (auto& k : keys) k.type = INPUT_KEYBOARD;
+        keys[0].ki.wVk = keys[3].ki.wVk = VK_LWIN;
+        keys[1].ki.wVk = keys[2].ki.wVk = VK_SPACE;
+        keys[2].ki.dwFlags = keys[3].ki.dwFlags = KEYEVENTF_KEYUP;
+        SendInput(ARRAYSIZE(keys), keys, sizeof(INPUT));
+    }
+    extra.activeKeyboardHkl = targetHkl;
+    for (auto& item : extra.keyboardLayouts) {
+        item.active = (item.hkl == targetHkl);
+        if (item.active) {
+            extra.keyboardShort = item.shortCode;
+            extra.keyboardSub = item.subCode;
+        }
+    }
+    paintBar();
+    if (panel && page == KeyboardLang) paintSheet();
+}
+
+void Dock::cycleKeyboardLayout(int delta) {
+    sampleKeyboardLayout();
+    if (extra.keyboardLayouts.size() < 2) {
+        report(L"Yalnızca tek klavye düzeni yüklü.");
+        return;
+    }
+    int cur = 0;
+    for (int i = 0; i < static_cast<int>(extra.keyboardLayouts.size()); ++i) {
+        if (extra.keyboardLayouts[i].active) { cur = i; break; }
+    }
+    const int n = static_cast<int>(extra.keyboardLayouts.size());
+    const int next = ((cur + (delta >= 0 ? 1 : -1)) % n + n) % n;
+    switchKeyboardLayout(extra.keyboardLayouts[next].hkl);
 }
 void Dock::changeVolume(int by, bool mute) {
     audio(extra, by, mute);
@@ -924,13 +1234,19 @@ void Dock::setVolumeLevel(float level, bool instant, bool dragging) {
 }
 void Dock::sampleExtras(bool immediate) {
     const auto enabled = [&](int id) { return page == id || (shown(id) && !isFoldedWidget(id)); };
+    const auto& sb = model.statusBar;
+    const bool sbMic = sb.enabled && sb.microphone;
+    const bool sbKey = sb.enabled && sb.keyboard;
+    const bool sbNet = sb.enabled && sb.network;
+    const bool sbVol = sb.enabled && sb.volume;
+    const bool sbBat = sb.enabled && sb.battery;
     const auto stamp = GetTickCount64();
     if (enabled(NetworkWidget)) networkSample(extra, stamp);
     else extra.netAt = 0;
     if (enabled(Storage) && ((immediate && page == Storage) || !extra.lastDisks || stamp - extra.lastDisks >= 35000)) {
         extra.disks = localDisks(); extra.lastDisks = stamp;
     }
-    if (enabled(Power)) {
+    if (enabled(Power) || sbBat) {
         SYSTEM_POWER_STATUS power{};
         if (GetSystemPowerStatus(&power)) {
             battery = power.BatteryLifePercent == 255 ? -1 : power.BatteryLifePercent;
@@ -939,7 +1255,7 @@ void Dock::sampleExtras(bool immediate) {
             syncMeterTargets();
         }
     }
-    if ((enabled(Volume) || enabled(MicControl) || page == Quick) && !barVolumeDrag && !volumeDrag) {
+    if ((enabled(Volume) || enabled(MicControl) || page == Quick || sbVol) && !barVolumeDrag && !volumeDrag) {
         audio(extra, 0, false);
         if (extra.volume >= 0) {
             const float sampled = extra.muted ? 0.f : std::clamp(extra.volume / 100.f, 0.f, 1.f);
@@ -952,8 +1268,14 @@ void Dock::sampleExtras(bool immediate) {
             }
         }
     }
-    if (enabled(MicControl)) sampleMicrophone();
-    if (page == Quick || enabled(QuickToggles)) queryRadios();
+    if (enabled(MicControl) || sbMic) sampleMicrophone();
+    if (sbKey || page == KeyboardLang) sampleKeyboardLayout();
+    if (sbNet) sampleNetworkFast();
+    if (page == Quick || enabled(QuickToggles) ||
+        (sbNet && (immediate || !extra.lastRadioPollAt || stamp - extra.lastRadioPollAt >= 10000))) {
+        extra.lastRadioPollAt = stamp;
+        queryRadios();
+    }
     if (immediate && mediaInUse()) queryMedia();
     if (page == Quick) {
         queryQuickStates();
@@ -1646,6 +1968,50 @@ void Dock::setAudioEndpoint(const Text& deviceId) {
     }
 }
 
+void Dock::refreshMicEndpoints() {
+    extra.micDevices.clear();
+    ComPtr<IMMDeviceEnumerator> enumerator;
+    if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&enumerator))) || !enumerator)
+        return;
+    Text defaultId;
+    ComPtr<IMMDevice> def;
+    if ((SUCCEEDED(enumerator->GetDefaultAudioEndpoint(eCapture, eCommunications, &def)) ||
+         SUCCEEDED(enumerator->GetDefaultAudioEndpoint(eCapture, eConsole, &def))) && def) {
+        LPWSTR raw{};
+        if (SUCCEEDED(def->GetId(&raw)) && raw) { defaultId = raw; CoTaskMemFree(raw); }
+    }
+    ComPtr<IMMDeviceCollection> collection;
+    if (FAILED(enumerator->EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE, &collection)) || !collection) return;
+    UINT count = 0;
+    collection->GetCount(&count);
+    for (UINT i = 0; i < count; ++i) {
+        ComPtr<IMMDevice> device;
+        if (FAILED(collection->Item(i, &device)) || !device) continue;
+        LPWSTR rawId{};
+        if (FAILED(device->GetId(&rawId)) || !rawId) continue;
+        Text id = rawId;
+        CoTaskMemFree(rawId);
+        Text name = endpointName(*device.Get());
+        if (name.empty()) name = L"Mikrofon";
+        extra.micDevices.push_back({id, name, id == defaultId});
+    }
+    std::stable_sort(extra.micDevices.begin(), extra.micDevices.end(), [](const auto& a, const auto& b) {
+        return a.active > b.active;
+    });
+}
+
+void Dock::setMicEndpoint(const Text& deviceId) {
+    if (deviceId.empty()) return;
+    if (setDefaultAudioEndpointId(deviceId)) {
+        sampleMicrophone();
+        refreshMicEndpoints();
+        paintBar();
+        paintSheet();
+    } else {
+        report(L"Mikrofon aygıtı değiştirilemedi.");
+    }
+}
+
 void Dock::openQuickSub(QuickSubPanel sub) {
     extra.quickSub = sub;
     listOffset = 0;
@@ -1914,7 +2280,7 @@ bool Dock::tickExtras(ULONGLONG stamp, const SYSTEMTIME& local) {
         const int prevBt = extra.radios.bluetooth;
         try { extra.radios = extra.radioRequest.get(); }
         catch (const std::exception&) { extra.radios.denied = true; }
-        if (shown(QuickToggles)) dirty = true;
+        if (shown(QuickToggles) || (model.statusBar.enabled && model.statusBar.network)) dirty = true;
         if (page == Quick) {
             refreshWifi(false, extra.quickSub == QuickSubPanel::Wifi);
             if (extra.quickSub == QuickSubPanel::Bluetooth && (extra.radios.bluetooth != prevBt || extra.btDevices.empty()))

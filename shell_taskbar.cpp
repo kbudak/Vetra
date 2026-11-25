@@ -8,6 +8,7 @@
 
 namespace {
 constexpr wchar_t Property[] = L"Vetra.HiddenTaskbar.v1";
+constexpr wchar_t OrigStateProperty[] = L"Vetra.OrigTaskbarState.v1";
 constexpr wchar_t SecondaryLayerProperty[] = L"Vetra.LayeredTaskbar.v1";
 constexpr wchar_t LegacyProperty[] = L"PrismDock.HiddenTaskbar.v1";
 constexpr wchar_t RestoreMode[] = L"--restore-taskbar";
@@ -161,25 +162,40 @@ bool ShellTaskbar::start(bool deferAutohide) {
         return true;
     }
     const HWND primaryBar = FindWindowW(L"Shell_TrayWnd", nullptr);
-    const bool wasHiddenByDock = primaryBar && (!IsWindowVisible(primaryBar) ||
-        GetPropW(primaryBar, Property) != nullptr || GetPropW(primaryBar, LegacyProperty) != nullptr);
-    originalState = taskbarState();
-    if (wasHiddenByDock) originalState &= ~ABS_AUTOHIDE;
+    const HANDLE savedProp = primaryBar ? GetPropW(primaryBar, OrigStateProperty) : nullptr;
+    if (savedProp) {
+        originalState = static_cast<UINT>(reinterpret_cast<uintptr_t>(savedProp) - 1);
+    } else {
+        const bool wasHiddenByDock = primaryBar && (!IsWindowVisible(primaryBar) ||
+            GetPropW(primaryBar, Property) != nullptr || GetPropW(primaryBar, LegacyProperty) != nullptr);
+        originalState = taskbarState();
+        if (wasHiddenByDock) originalState &= ~ABS_AUTOHIDE;
+        if (primaryBar) SetPropW(primaryBar, OrigStateProperty,
+            reinterpret_cast<HANDLE>(static_cast<uintptr_t>(originalState) + 1));
+    }
     wchar_t image[MAX_PATH]{};
     if (!GetModuleFileNameW(nullptr, image, ARRAYSIZE(image))) return false;
     HANDLE parent{};
     if (!DuplicateHandle(GetCurrentProcess(), GetCurrentProcess(), GetCurrentProcess(), &parent,
         SYNCHRONIZE, TRUE, 0)) return false;
 
+    SECURITY_ATTRIBUTES inheritSa{sizeof(inheritSa), nullptr, TRUE};
+    if (cancelWatchdog) { CloseHandle(cancelWatchdog); cancelWatchdog = nullptr; }
+    cancelWatchdog = CreateEventW(&inheritSa, TRUE, FALSE, nullptr);
+    HANDLE inheritList[2]{parent, cancelWatchdog};
+    const DWORD inheritCount = cancelWatchdog ? 2u : 1u;
+
     SIZE_T bytes = 0;
     InitializeProcThreadAttributeList(nullptr, 1, 0, &bytes);
     auto* attributes = static_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(HeapAlloc(GetProcessHeap(), 0, bytes));
     if (attributes && InitializeProcThreadAttributeList(attributes, 1, 0, &bytes)) {
-        if (UpdateProcThreadAttribute(attributes, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, &parent,
-            sizeof(parent), nullptr, nullptr)) {
-            wchar_t command[MAX_PATH + 100]{};
-            swprintf_s(command, L"\"%s\" %s %lu %llu %u", image, RestoreMode, GetCurrentProcessId(),
-                static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(parent)), originalState);
+        if (UpdateProcThreadAttribute(attributes, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inheritList,
+            inheritCount * sizeof(HANDLE), nullptr, nullptr)) {
+            wchar_t command[MAX_PATH + 140]{};
+            swprintf_s(command, L"\"%s\" %s %lu %llu %llu %u", image, RestoreMode, GetCurrentProcessId(),
+                static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(parent)),
+                static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(cancelWatchdog)),
+                originalState);
             STARTUPINFOEXW startup{};
             startup.StartupInfo.cb = sizeof(startup);
             startup.StartupInfo.dwFlags = STARTF_USESHOWWINDOW;
@@ -197,6 +213,7 @@ bool ShellTaskbar::start(bool deferAutohide) {
     }
     if (attributes) HeapFree(GetProcessHeap(), 0, attributes);
     CloseHandle(parent);
+    if (!guarded && cancelWatchdog) { CloseHandle(cancelWatchdog); cancelWatchdog = nullptr; }
     if (guarded) {
         autohideApplied = false;
         EnumWindows(hideBar, GetCurrentProcessId());
@@ -240,10 +257,41 @@ void ShellTaskbar::revealPrimary() const {
 }
 
 void ShellTaskbar::restore() {
+    if (cancelWatchdog) {
+        SetEvent(cancelWatchdog);
+        CloseHandle(cancelWatchdog);
+        cancelWatchdog = nullptr;
+    }
     if (!guarded) return;
     guarded = false;
+    autohideApplied = false;
+    const HWND primary = FindWindowW(L"Shell_TrayWnd", nullptr);
+    const HANDLE marker = primary ? GetPropW(primary, Property) : nullptr;
+    const HANDLE selfMarker = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(GetCurrentProcessId()));
+    const bool stillOwner = !marker || marker == selfMarker || ownerExited(marker);
+    if (stillOwner) {
+        if (primary) RemovePropW(primary, OrigStateProperty);
+        EnumWindows(restoreBar, 0);
+        setTaskbarState(originalState, true);
+        EnumWindows(restoreBar, 0);
+        SendNotifyMessageW(HWND_BROADCAST, WM_SETTINGCHANGE, SPI_SETWORKAREA, 0);
+    }
+}
+
+void ShellTaskbar::restoreIfOrphaned() {
+    if (guarded) return;
+    const HWND primary = FindWindowW(L"Shell_TrayWnd", nullptr);
+    const bool orphaned = primary && (!IsWindowVisible(primary) ||
+        GetPropW(primary, Property) != nullptr || GetPropW(primary, LegacyProperty) != nullptr ||
+        GetPropW(primary, OrigStateProperty) != nullptr);
+    if (!orphaned) return;
+    UINT targetState = taskbarState() & ~ABS_AUTOHIDE;
+    if (const HANDLE savedProp = GetPropW(primary, OrigStateProperty)) {
+        targetState = static_cast<UINT>(reinterpret_cast<uintptr_t>(savedProp) - 1);
+        RemovePropW(primary, OrigStateProperty);
+    }
     EnumWindows(restoreBar, 0);
-    setTaskbarState(originalState & ~ABS_AUTOHIDE, true);
+    setTaskbarState(targetState, true);
     EnumWindows(restoreBar, 0);
     SendNotifyMessageW(HWND_BROADCAST, WM_SETTINGCHANGE, SPI_SETWORKAREA, 0);
 }
@@ -251,18 +299,36 @@ void ShellTaskbar::restore() {
 bool ShellTaskbar::runRestoreMode(const wchar_t* command) {
     DWORD owner = 0;
     unsigned long long handle = 0;
+    unsigned long long cancelRaw = 0;
     unsigned state = 0;
-    if (swscanf_s(command, L"--restore-taskbar %lu %llu %u", &owner, &handle, &state) != 3) return false;
+    const int parsed4 = swscanf_s(command, L"--restore-taskbar %lu %llu %llu %u", &owner, &handle, &cancelRaw, &state);
+    if (parsed4 != 4) {
+        cancelRaw = 0;
+        if (swscanf_s(command, L"--restore-taskbar %lu %llu %u", &owner, &handle, &state) != 3) return false;
+    }
     HANDLE parent = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(handle));
-    if (WaitForSingleObject(parent, INFINITE) == WAIT_OBJECT_0) {
+    HANDLE cancel = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(cancelRaw));
+    HANDLE waitHandles[2]{parent, cancel};
+    const DWORD waitCount = cancel ? 2u : 1u;
+    const DWORD waitRes = WaitForMultipleObjects(waitCount, waitHandles, FALSE, INFINITE);
+    if (waitRes == WAIT_OBJECT_0) {
         const HWND taskbar = FindWindowW(L"Shell_TrayWnd", nullptr);
         const HANDLE marker = taskbar ? GetPropW(taskbar, Property) : nullptr;
-        EnumWindows(restoreBar, owner);
-        if (!marker || marker == reinterpret_cast<HANDLE>(static_cast<uintptr_t>(owner)) || ownerExited(marker))
-            setTaskbarState(state & ~ABS_AUTOHIDE, true);
-        EnumWindows(restoreBar, owner);
-        SendNotifyMessageW(HWND_BROADCAST, WM_SETTINGCHANGE, SPI_SETWORKAREA, 0);
+        const bool stillOwner = !marker || marker == reinterpret_cast<HANDLE>(static_cast<uintptr_t>(owner)) || ownerExited(marker);
+        if (stillOwner) {
+            if (taskbar) {
+                if (const HANDLE savedProp = GetPropW(taskbar, OrigStateProperty)) {
+                    state = static_cast<UINT>(reinterpret_cast<uintptr_t>(savedProp) - 1);
+                    RemovePropW(taskbar, OrigStateProperty);
+                }
+            }
+            EnumWindows(restoreBar, owner);
+            setTaskbarState(state, true);
+            EnumWindows(restoreBar, owner);
+            SendNotifyMessageW(HWND_BROADCAST, WM_SETTINGCHANGE, SPI_SETWORKAREA, 0);
+        }
     }
+    if (cancel) CloseHandle(cancel);
     CloseHandle(parent);
     return true;
 }

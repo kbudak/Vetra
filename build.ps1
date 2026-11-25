@@ -1,3 +1,6 @@
+param(
+    [switch]$NoLaunch
+)
 $ErrorActionPreference = 'Stop'
 $source = $PSScriptRoot
 $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
@@ -9,6 +12,20 @@ if (!$visualStudio) { throw 'MSVC x64 tools were not found.' }
 $vcvars = Join-Path $visualStudio 'VC\Auxiliary\Build\vcvars64.bat'
 $buildDir = Join-Path $source 'build'
 New-Item -Type Directory -Force -Path $buildDir | Out-Null
+
+# Safely stop only the main Vetra process and wait for its --restore-taskbar watchdog to finish restoring the taskbar cleanly
+$running = Get-CimInstance Win32_Process -Filter "Name='Vetra.exe'" -ErrorAction SilentlyContinue |
+    Where-Object { -not $_.CommandLine -or $_.CommandLine -notlike '*--restore-taskbar*' }
+if ($running) {
+    foreach ($proc in $running) {
+        Stop-Process -Id $proc.ProcessId -ErrorAction SilentlyContinue
+    }
+    for ($i = 0; $i -lt 30; $i++) {
+        if (-not (Get-Process -Name Vetra -ErrorAction SilentlyContinue)) { break }
+        Start-Sleep -Milliseconds 100
+    }
+}
+
 $batch = @"
 @echo off
 call "$vcvars" >nul
@@ -22,6 +39,10 @@ $script = Join-Path $buildDir 'compile.cmd'
 Set-Content -LiteralPath $script -Value $batch -Encoding Default
 & cmd.exe /d /c $script
 if ($LASTEXITCODE -ne 0) { throw "Vetra build failed ($LASTEXITCODE)." }
+
+if (-not $NoLaunch) {
+    Start-Process -FilePath (Join-Path $buildDir 'Vetra.exe') | Out-Null
+}
 
 
 

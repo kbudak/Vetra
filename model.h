@@ -41,7 +41,7 @@ enum Widget {
     ClaudeUsage, ClaudePlanUsage, GeminiUsage, GrokUsage, DeepSeekBalance, GlmUsage,
     OpenCodeUsage, OpenCodePlanUsage, CursorUsage, StartButton, AiLimitsTriple,
     DayTimeline, WhatsApp, Currency, MediaCompact, MediaMini, MediaBar, MicControl, QuickToggles, WidgetCount,
-    Studio = WidgetCount, ContextMenu, SystemTray, AppMenu, Overflow, ChromeWindows
+    Studio = WidgetCount, ContextMenu, SystemTray, AppMenu, Overflow, ChromeWindows, KeyboardLang
 };
 enum WidgetGroup { Workspace, Productivity, Device, Analytics, WeatherGroup, MarketGroup, AppGroup, AiGroup };
 enum Profile { Developer, Seller, Founder, Student, ProfileCount };
@@ -180,10 +180,23 @@ struct AiOverride {
 };
 enum class DockVisibility { Overlay, Edge, Reserved };
 
+struct StatusBarConfig {
+    bool enabled = true;
+    bool microphone = true;
+    bool micOnlyInUse = false;
+    bool keyboard = true;
+    bool network = true;
+    bool volume = true;
+    bool battery = true;
+    bool clock = true;
+    bool notifications = true;
+};
+
 struct Model {
     int profile = Student;
     AppearanceTheme theme = LiquidGlass;
     int opacity = 50, size = 1, edge = 0, alignment = 1, accent = 0;
+    StatusBarConfig statusBar;
     int focusMinutes = 25, countdownMinutes = 5, worldCity = 3, weatherCity = -1;
     int usageDay = 0;
     std::array<int, 24> usageSeconds{};
@@ -194,6 +207,7 @@ struct Model {
     std::vector<UsageDaily> usageHistory;
     std::vector<UsageApp> usageApps;
     bool topmost = true;
+    bool hideTaskbar = true;
     DockVisibility visibility = DockVisibility::Overlay;
     bool autoHides() const { return visibility == DockVisibility::Edge; }
     Text repo;

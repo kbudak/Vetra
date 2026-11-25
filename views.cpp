@@ -156,7 +156,7 @@ void Dock::paintBarView(View& view, const std::vector<OrderItem>& overflow, cons
     if (!view.hwnd || !d.begin(view.hwnd, static_cast<int>(std::lround(view.w * view.scale)),
         static_cast<int>(std::lround(view.h * view.scale)), view.scale)) return;
     view.hits.clear();
-    if (active) barVolumeCard = barVolumeTrack = {};
+    if (active) barVolumeCard = barVolumeTrack = statusVolumeHit = statusKeyboardHit = {};
     Palette p(model);
     const auto body = d.snap(box(1, 1, view.w - 2, view.h - 2));
     p.surface(d, body, 22.f, false);
@@ -293,8 +293,17 @@ void Dock::paintBarView(View& view, const std::vector<OrderItem>& overflow, cons
         reveal.top + (Design::CardHeight - 16.f) / 2.f + chevOff, 16.f, 16.f),
         tint(revealActive ? p.accent : p.ink, .86f));
 
+    // Windows-style System Status Area (Microphone, Keyboard Language, Network, Volume, Battery, Clock, Notifications)
+    x += Design::TrayWidth;
+    const float sbWidth = statusBarWidth();
+    if (sbWidth > 0.f) {
+        x += Design::StatusBarGap;
+        drawStatusBar(view, x, p);
+        x += sbWidth;
+    }
+
     // Windows-style Show Desktop sliver at the far right end of the dock
-    x += Design::TrayWidth + Design::DesktopStripGap;
+    x += Design::DesktopStripGap;
     const auto desk = box(x, Design::DockInset, Design::DesktopStripWidth, Design::CardHeight);
     if (p.theme == BareTheme) p.card(d, desk, 9.f);
     hit(view, desk, [this] { toggleDesktop(); });
@@ -380,7 +389,7 @@ void Dock::paintSheet(const POINT* origin) {
     sheet.hits.clear();
     quickVolumeTrack = {};
     Palette p(model);
-    const bool compact = page == ContextMenu || page == AppMenu || page == SystemTray || page == ChromeWindows;
+    const bool compact = page == ContextMenu || page == AppMenu || page == SystemTray || page == ChromeWindows || page == KeyboardLang;
     const auto surface = box(6, 4, sheet.w - 12, sheet.h - 12);
     if (page == Studio) {
         p.glass = false;
@@ -392,7 +401,7 @@ void Dock::paintSheet(const POINT* origin) {
         d.fill(surface, 18, tint(p.base));
         d.outline(inset(surface, .5f), 17.5f, tint(p.line, .30f));
     } else p.surface(d, surface, compact ? 20.f : p.glass ? 22.f : 24.f);
-    if (page == AppMenu || page == ContextMenu || page == SystemTray || page == Overflow || page == ChromeWindows) {
+    if (page == AppMenu || page == ContextMenu || page == SystemTray || page == Overflow || page == ChromeWindows || page == KeyboardLang) {
         const float bottom = model.edge == 0 ? sheet.h - 8 : 5;
         d.fill(box(sheetTail - 11, bottom - 1.f, 22, 2), 1.f, tint(p.accent, p.glass ? .32f : .68f));
     }
@@ -400,6 +409,7 @@ void Dock::paintSheet(const POINT* origin) {
     case ContextMenu: contextMenu(p); break;
     case Overflow: overflowPanel(p); break;
     case ChromeWindows: chromeWindowsPanel(p); break;
+    case KeyboardLang: keyboardPanel(p); break;
     case Quick:
         extraPanel(p);
         break;
@@ -943,8 +953,8 @@ void Dock::studio(Palette p) {
     d.line(214, 29, 214, sheet.h - 35, tint(p.ink, .08f));
     d.icon(Logo, d.snap(box(32, 32, 41, 41)), tint(0xF3F6FC));
     d.text(L"Vetra", box(85, 32, 95, 41), Value, tint(p.ink));
-    constexpr const wchar_t* tabs[] = {L"Düzen", L"Widget kataloğu", L"Görünüm", L"Kısayollar"};
-    constexpr Glyph icons[] = {Layers, Plus, Sliders, PinIcon};
+    constexpr const wchar_t* tabs[] = {L"Düzen", L"Widget kataloğu", L"Görünüm", L"Kısayollar", L"Durum alanı"};
+    constexpr Glyph icons[] = {Layers, Plus, Sliders, PinIcon, Activity};
     const float targetNavY = 104.f + tab * 41.f;
     if (!studioNavY.initialized) studioNavY.snap(targetNavY);
     else if (std::abs(studioNavY.target - targetNavY) > 0.5f) {
@@ -1095,23 +1105,23 @@ void Dock::studio(Palette p) {
         }
 
         const auto row = [&](float y, const Text& label) {
-            p.card(d, box(content, y, right - content, 45), 15);
-            d.text(label, box(content + 15, y, 225, 45), TileLabel, tint(p.ink));
+            p.card(d, box(content, y, right - content, 40), 13);
+            d.text(label, box(content + 15, y, 250, 40), TileLabel, tint(p.ink));
         };
         const auto choices = [&](float y, const Text& label, std::initializer_list<const wchar_t*> values, int& selected) {
             row(y, label);
             const float pitch = 310.f / values.size();
             int index = 0;
             for (const auto item : values) {
-                button(sheet, p, box(right - 324 + index * pitch, y + 7, pitch - 5, 31), item,
+                button(sheet, p, box(right - 324 + index * pitch, y + 5, pitch - 5, 30), item,
                     [this, destination = &selected, index] { *destination = index; changed(true); }, selected == index);
                 ++index;
             }
         };
-        float y = 251;
+        float y = 248;
         row(y, L"Vurgu rengi");
         for (int i = 0; i < ARRAYSIZE(Accents); ++i) {
-            const auto chip = box(right - 332 + i * 62.f, y + 7, 57, 31);
+            const auto chip = box(right - 332 + i * 62.f, y + 5, 57, 30);
             const auto color = i == 0 ? p.ink : p.light ? Accents[i].light : Accents[i].dark;
             const bool selected = model.accent == i;
             hit(sheet, chip, [this, i] { model.accent = i; changed(false); });
@@ -1120,17 +1130,17 @@ void Dock::studio(Palette p) {
             if (selected) d.outline(inset(chip, .5f), 8, tint(color, .72f));
             d.text(Accents[i].label, chip, Small, tint(p.ink), Center);
         }
-        y += 50;
+        y += 45;
         if (glassTheme(model.theme)) {
             row(y, L"Cam tonu");
             const unsigned blueStart = p.light ? 0x0A7AFF : 0x2684FF;
             const unsigned blueEnd = p.light ? 0x3A9BFF : 0x5BB6FF;
-            const float x = right - 324, track = 258, center = y + 22.5f;
+            const float x = right - 324, track = 258, center = y + 20.f;
             const float smoothOp = opacityAnim.initialized ? std::clamp(opacityAnim.value, 0.f, 100.f) : static_cast<float>(model.opacity);
             const float portion = std::clamp(smoothOp / 100.f, 0.f, 1.f);
             const Box trackBox = box(x, center - 5.5f, track, 11.f);
             opacitySliderTrack = trackBox;
-            hit(sheet, box(x - 4.f, y + 6.f, track + 8.f, 33.f), [] {});
+            hit(sheet, box(x - 4.f, y + 4.f, track + 8.f, 32.f), [] {});
             const float sliderHover = sheet.hoverAmount();
             d.fill(trackBox, 5.5f, tint(p.light ? 0xD8D8DC : 0xFFFFFF, p.light ? 1.f : .13f));
             const float fillW = track * portion;
@@ -1142,14 +1152,14 @@ void Dock::studio(Palette p) {
             const float thumbVis = opacitySliderDrag ? 1.f : std::max(0.75f, sliderHover);
             const float knobX = std::clamp(trackBox.left + std::max(5.5f, fillW - 5.5f), trackBox.left + 5.5f, trackBox.right - 5.5f);
             d.circle(knobX, center, opacitySliderDrag ? 4.3f : 3.6f, tint(0xFFFFFF, .96f * thumbVis));
-            d.text(percent(model.opacity), box(x + track + 8.f, y + 7.f, 44.f, 31.f), Caption,
+            d.text(percent(model.opacity), box(x + track + 8.f, y + 5.f, 44.f, 30.f), Caption,
                 tint(opacitySliderDrag ? blueEnd : p.muted), Right);
-            y += 50;
+            y += 45;
         }
         choices(y, L"Dock boyutu", {L"Kompakt", L"Standart", L"Geniş"}, model.size);
-        choices(y + 50, L"Ekran kenarı", {L"Alt", L"Üst"}, model.edge);
-        choices(y + 100, L"Hizalama", {L"Sol", L"Orta", L"Sağ"}, model.alignment);
-        row(y + 150, L"Dock görünürlüğü");
+        choices(y + 45, L"Ekran kenarı", {L"Alt", L"Üst"}, model.edge);
+        choices(y + 90, L"Hizalama", {L"Sol", L"Orta", L"Sağ"}, model.alignment);
+        row(y + 135, L"Dock görünürlüğü");
         constexpr std::pair<DockVisibility, const wchar_t*> visibilityModes[] = {
             {DockVisibility::Overlay, L"Sabit göster"},
             {DockVisibility::Edge, L"Kenar ile aç"},
@@ -1157,20 +1167,27 @@ void Dock::studio(Palette p) {
         };
         for (size_t i = 0; i < std::size(visibilityModes); ++i) {
             const auto [mode, label] = visibilityModes[i];
-            button(sheet, p, box(right - 324 + 103.f * i, y + 157, 98, 31), label, [this, mode] {
+            button(sheet, p, box(right - 324 + 103.f * i, y + 140, 98, 30), label, [this, mode] {
                 model.visibility = mode;
                 model.topmost = true;
                 changed(true);
             }, model.visibility == mode);
         }
-        row(y + 200, L"Monitör");
-        d.text(L"Tüm monitörler", box(right - 225, y + 207, 205, 31), Caption, tint(p.ink), Right);
-        row(y + 250, L"Windows ile başlat");
-        knob(p, box(right - 61, y + 261, 43, 24), boot, [this] {
+        row(y + 180, L"Windows görev çubuğunu gizle");
+        knob(p, box(right - 61, y + 188, 43, 24), model.hideTaskbar, [this] {
+            model.hideTaskbar = !model.hideTaskbar;
+            if (model.hideTaskbar) shellTaskbar.start(false);
+            else shellTaskbar.restore();
+            changed(true);
+        });
+        row(y + 225, L"Monitör");
+        d.text(L"Tüm monitörler", box(right - 225, y + 230, 205, 30), Caption, tint(p.ink), Right);
+        row(y + 270, L"Windows ile başlat");
+        knob(p, box(right - 61, y + 278, 43, 24), boot, [this] {
             if (model.setStartup(!boot)) { boot = !boot; paintSheet(); }
             else report(L"Başlangıç ayarı değiştirilmedi.");
         });
-    } else {
+    } else if (tab == 3) {
         button(sheet, p, box(content, 89, 142, 34), L"Uygulamalar", [this] { open(Apps); }, true);
         button(sheet, p, box(content + 152, 89, 139, 34), L"+ Özel kısayol", [this] { editShortcut(-1); });
         button(sheet, p, box(content + 301, 89, 177, 34), L"Windows sabitlerini al", [this] { importTaskbarPins(); });
@@ -1207,6 +1224,54 @@ void Dock::studio(Palette p) {
             iconButton(sheet, p, box(right - 72, 549, 32, 30), ChevronLeft, [this] { shortcutOffset -= 8; paintSheet(); });
             iconButton(sheet, p, box(right - 33, 549, 32, 30), ChevronRight, [this] { shortcutOffset += 8; paintSheet(); });
         }
+    } else if (tab == 4) {
+        auto& sb = model.statusBar;
+        const auto masterCard = box(content, 88, right - content, 54);
+        p.card(d, masterCard, 16);
+        d.text(L"Windows durum alanını göster", box(content + 16, 94, right - content - 100, 22), Strong, tint(p.ink));
+        d.text(L"Ağ, mikrofon, klavye dili, ses, pil, saat ve bildirimleri dock’un sağ ucunda göster",
+            box(content + 16, 116, right - content - 100, 18), Caption, tint(p.muted));
+        knob(p, box(right - 60, 103, 43, 24), sb.enabled, [this] {
+            model.statusBar.enabled = !model.statusBar.enabled;
+            if (model.statusBar.enabled) sampleExtras(true);
+            changed(true);
+        });
+
+        struct StatusRow { Glyph icon; const wchar_t* title; const wchar_t* desc; bool* value; bool sub; };
+        StatusRow rows[] = {
+            {MicIcon, L"Mikrofon göstergesi", L"Aktif kayıt rengi, hızlı susturma (sağ tık) ve giriş seçici", &sb.microphone, false},
+            {MicIcon, L"Mikrofonu yalnızca kullanımda göster", L"Bir uygulama mikrofonu kullandığında veya susturulduğunda görünür", &sb.micOnlyInUse, true},
+            {KeyboardIcon, L"Klavye dili", L"Aktif klavye düzeni (TR/EN), tek tık seçici ve sağ tık/tekerlek geçişi", &sb.keyboard, false},
+            {EthernetIcon, L"İnternet bağlantısı", L"Ethernet, Wi-Fi veya çevrimdışı durum simgesi ve Denetim Merkezi", &sb.network, false},
+            {Speaker, L"Ses seviyesi", L"Dinamik hoparlör simgesi, sağ tık susturma ve tekerlekle ses ayarı", &sb.volume, false},
+            {Battery, L"Pil ve şarj durumu", L"Doluluk ve şarj simgesi (pil algılanmazsa otomatik gizlenir)", &sb.battery, false},
+            {Timer, L"Saat ve tarih", L"Windows tarzı iki satırlı saat ve tarih (tıklayınca Takvim açılır)", &sb.clock, false},
+            {BellIcon, L"Bildirimler", L"Windows Bildirim Merkezi düğmesi (Win + N)", &sb.notifications, false},
+        };
+        const float rowAlpha = sb.enabled ? 1.f : .45f;
+        for (int i = 0; i < static_cast<int>(ARRAYSIZE(rows)); ++i) {
+            const auto& r = rows[i];
+            const float y = 152.f + i * 50.f;
+            const float leftPad = r.sub ? 22.f : 0.f;
+            const Box card = box(content + leftPad, y, right - content - leftPad, 44);
+            p.card(d, card, 13);
+            const float alpha = (sb.enabled && (!r.sub || sb.microphone)) ? 1.f : .42f;
+            if (!r.sub) {
+                d.fill(box(card.left + 11, y + 9, 26, 26), 8, tint(p.accent, .14f * alpha));
+                d.icon(r.icon, box(card.left + 16, y + 14, 16, 16), tint(p.ink, .88f * alpha));
+            }
+            const float textX = card.left + (r.sub ? 15.f : 46.f);
+            d.text(r.title, box(textX, y + 5, card.right - textX - 68.f, 18), TileLabel, tint(p.ink, alpha));
+            d.text(r.desc, box(textX, y + 23, card.right - textX - 68.f, 16), Small, tint(p.muted, alpha));
+            knob(p, box(right - 60, y + 10, 43, 24), *r.value, [this, ptr = r.value] {
+                *ptr = !*ptr;
+                if (!model.statusBar.enabled && *ptr) model.statusBar.enabled = true;
+                sampleExtras(true);
+                changed(true);
+            });
+        }
+        d.text(L"İpucu: Durum alanındaki simgelere sağ tıklayarak susturma, düzen değiştirme veya Windows ayarlarını açabilirsin.",
+            box(content, 560, right - content, 24), Small, tint(p.muted, rowAlpha));
     }
     d.popMotion(tabMotion);
 }

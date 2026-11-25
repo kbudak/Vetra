@@ -35,7 +35,7 @@ Sadece uygulama başlatmakla kalmaz; **75 modüler widget**, **yerel Denetim Mer
 - **Sabit göster:** Dock’u seçili kenarda sürekli görünür tutar; büyütülen pencereler dock’un arkasına uzanabilir.
 - **Kenar ile aç:** İmleç ekran kenarına geldiğinde dock’u yumuşakça açar, ayrılınca gizler.
 - **Yer ayır:** Büyütülen pencerelerin (Chrome, VS Code, Dosya Gezgini vb.) dock’un arkasına girmesini engelleyecek çalışma alanını her monitörde ayırır — bunu masaüstüne `SPIF_SENDCHANGE` yayını göndermeden sessiz `SPI_SETWORKAREA` ile yaptığı için **masaüstü simge düzenini bozmaz**.
-- **Güvenli görev çubuğu yönetimi:** Vetra çalışırken Windows görev çubuğunu gizler; normal çıkışta veya beklenmedik kapanmada izleyici süreç (`--restore-taskbar`) görev çubuğunu otomatik olarak geri yükler.
+- **Güvenli görev çubuğu yönetimi:** Vetra çalışırken Windows görev çubuğunu gizler (isteğe bağlı olarak **Görünüm → Windows görev çubuğunu gizle** üzerinden kapatılabilir). Normal çıkışta veya beklenmedik kapanmada izleyici süreç (`--restore-taskbar`) görev çubuğunu Vetra açılmadan önceki son Windows ayarına (`ABS_AUTOHIDE` durumu dahil) otomatik olarak geri yükler.
 
 ### Akıllı Uygulama Şeridi ve Evrensel Jump List Desteği
 - **Özgür sürükle-bırak düzeni:** Widget’ları, sabit uygulamaları ve açık pencereleri dock üzerinde birbirlerinin arasına serbestçe sürükleyebilir; masaüstünden, Gezgin’den veya Başlat’tan uygulama / `.lnk` kısayolu bırakarak sabitleyebilirsin (**Windows sabitlerini al** dahil).
@@ -49,7 +49,12 @@ Sadece uygulama başlatmakla kalmaz; **75 modüler widget**, **yerel Denetim Mer
   - Alt bölümde **Dock’a sabitle / kaldır**, **Pencereye geç / Uygulamayı aç** ve açık pencereler için **Pencereyi kapat / Tüm pencereleri kapat (N)** yer alır.
 - **Chrome çoklu pencere önizlemesi:** İmleci açık Chrome simgesi üzerinde bekletince küçültülmüş olanlar dahil tüm Chrome pencereleri canlı kartlar hâlinde listelenir.
 
-### Yerel Denetim Merkezi ve Sıfır Titremeli Gizli Simgeler
+### Yerel Denetim Merkezi, Windows Durum Alanı ve Sıfır Titremeli Gizli Simgeler
+- **Windows Durum Alanı:** Dock’un sağ ucunda `^` (Gizli simgeler) ile `|` (Masaüstünü göster) arasında Windows görev çubuğu tarzında bütünleşik bir durum şeridi yer alır ve **Ayarlar → Durum alanı** sekmesinden tüm öğeleri tek tek açılıp kapatılabilir:
+  - **Mikrofon göstergesi:** Bir uygulama mikrofonu aktif kullandığında canlı turkuaz renge ve nokta işaretine döner, susturulduğunda kırmızı çarpılı simge gösterir. Sol tık **Mikrofon** panelini (aktif kayıt yapan uygulama adı, hızlı susturma, giriş aygıtı seçici ve gizlilik/ses ayarları), sağ tık anlık susturmayı çalıştırır. İsteğe bağlı olarak **yalnızca kullanımda göster** modu açılabilir.
+  - **Klavye dili (`TR`, `EN` vb.):** Etkin pencerenin klavye düzenini canlı takip eder (aynı dilde birden fazla düzen varsa `Q`/`F`/`US` alt etiketiyle). Sol tık yüklü düzenleri listeleyen **Klavye dili** seçici panelini açar; sağ tık veya fare tekerleği bir sonraki düzene anında geçer.
+  - **İnternet bağlantısı, Ses ve Pil:** Ethernet (kablolu monitör/fiş), Wi-Fi, uçak modu veya çevrimdışı durum simgesi; dinamik ses simgesi (sağ tık susturma, fare tekerleğiyle ±%4 ses ayarı); pil algılanan cihazlarda şarj şimşekli canlı pil göstergesi.
+  - **Saat, tarih ve Bildirimler:** İki satırlı Windows saat/tarih bloğu (sol tık Takvim paneli, sağ tık tarih/saat ayarları) ve Windows Bildirim Merkezi zil düğmesi (`Win + N`).
 - **Denetim Merkezi:** Dock’a bitişik iki sayfalı panelde **Wi-Fi** (canlı ağ taraması ve kayıtlı profiller), **Bluetooth** (A2DP Stereo + HFP `ContainerId` eşleştirmeli doğrudan ses bağlantısı ve varsayılan çıkış geçişi), **Uçak modu**, **Enerji tasarrufu**, **Gece ışığı**, **Mobil etkin nokta**, **Yansıt** (çoklu ekran düzenleri), **Erişilebilirlik** (7 yerel anahtar), **Yakın paylaşım**, **Ses çıkışı seçici** ve **canlı Medya kartı** (Windows SMTC oynat/duraklat, ileri/geri veya ±10 sn sarma) tek panelde çalışır.
 - **Gizli simgeler (`^`):** Yüksek çözünürlüklü 5 sütunlu ızgara (`NotifyIconSettings` PNG, MSIX ve `.exe` kaynakları). Sağ tık, taşma penceresini ve açılan yerel menüyü ekranda titreme oluşturmadan gizlice yakalayıp (`#32768`, çok seviyeli alt menüler, WinUI 3, Electron, WebView2, WPF, Qt) doğrudan Vetra temasında gösterir ve komutu gerçek uygulamada çalıştırır.
 - **Masaüstünü göster (`|`):** Dock’un en sağ ucundaki ince şerit tüm açık pencereleri aşağı alır veya geri getirir.
@@ -86,7 +91,7 @@ cd Vetra
 ./build.ps1
 ```
 
-Derleme `build\Vetra.exe` dosyasını üretir. Ek kurulum veya DLL kopyalaması gerekmez; doğrudan `build\Vetra.exe` dosyasını çalıştırman yeterlidir.
+Derleme `build\Vetra.exe` dosyasını üretir ve varsayılan olarak uygulamayı otomatik yeniden başlatır (`./build.ps1 -NoLaunch` yalnızca derleme yapar). Ek kurulum veya DLL kopyalaması gerekmez.
 
 > İstersen **Ayarlar → Genel** üzerinden **Windows ile başlat** seçeneğini açabilirsin.
 
@@ -101,9 +106,9 @@ Derleme `build\Vetra.exe` dosyasını üretir. Ek kurulum veya DLL kopyalaması 
 | **Sağ tık (uygulama simgesi)** | Uygulamanın Windows Jump List görevlerini, sabitleme ve pencere kapatma menüsünü açar |
 | **Basılı tutup yatay sürükleme** | Widget’ları, sabit uygulamaları ve açık pencereleri yeniden sıralar (**Esc** iptal eder) |
 | **V simgesinden veya dikey dışarı sürükleme** | Dock’u üst/alt kenara ve sol/orta/sağ hizalamaya taşır |
-| **Fare tekerleği** | Ses/Cam tonu kaydırıcılarını ayarlar; Katalog, Jump List, Chrome önizlemeleri ve listeleri kaydırır |
+| **Fare tekerleği** | Ses/Cam tonu kaydırıcılarını, durum alanı ses simgesini ve klavye dilini ayarlar; Katalog, Jump List, Chrome önizlemeleri ve listeleri kaydırır |
 | **Tab / Enter / Esc / F5** | Açık panelde gezinir, seçer, kapatır / üst menüye döner; Gizli simgeler ve Chrome önizlemelerinde yeniler |
-| **`^` ve `\|` (sağ uç)** | Gizli bildirim simgelerini açar / Masaüstünü gösterir |
+| **`^`, Durum alanı ve `\|` (sağ uç)** | Gizli bildirim simgelerini açar / mikrofon, klavye dili, ağ, ses, pil, saat ve bildirimleri yönetir / Masaüstünü gösterir |
 
 ---
 
@@ -130,6 +135,7 @@ Derleme `build\Vetra.exe` dosyasını üretir. Ek kurulum veya DLL kopyalaması 
 - **Performans mimarisi:** Direct2D G2 yuvarlatılmış dikdörtgen, yay, sparkline, grafik ve cam kenarı fırça önbellekleri; `SetWinEventHook` olay tabanlı pencere takibi; kalıcı PDH sıcaklık ve `% Processor Utility` sayaçları; arka planda geciktirilmiş başlangıç (`Dock::initialize()` ~86 ms, kararlı 3 sn boşta CPU ~16 ms).
 - **Bilinen Windows sınırları:**
   - **Yükseltilmiş (UIPI korumalı) sistem tepsisi simgeleri** (ör. NVIDIA, Monster) için güvenlik sınırı nedeniyle yerel hızlı menü veya uygulama kısayolu sunulur.
+  - **Yükseltilmiş ön plan pencerelerinde klavye dili değiştirme** sırasında Windows UIPI sınırı `WM_INPUTLANGCHANGEREQUEST` iletisini engellerse Vetra otomatik olarak `Win + Boşluk` geçişine düşer.
   - **Windows 11 24H2+ canlı Wi-Fi taraması** için Windows Konum izni açık olmalıdır; kapalıysa panel bunu bildirir ve kayıtlı profilleri ayrı gösterir.
   - **WhatsApp bildirim sayısı** paket kimliği ve Windows bildirim izni gerektirir.
   - **Takvim, Satış ve Büyüme** kayıtları yerelde tutulur; bulut senkronizasyonu yoktur.
@@ -153,3 +159,13 @@ Derleme `build\Vetra.exe` dosyasını üretir. Ek kurulum veya DLL kopyalaması 
 | `data_feeds.cpp`, `productivity.cpp`, `timers.cpp` | Hava durumu, piyasa beslemeleri, gün çizelgesi, döviz, WhatsApp ve Pomodoro/sayaç motoru |
 | `model.cpp`, `model.h`, `editor.cpp` | Profil, ayar ve yerel kayıtların kalıcı saklanması ile düzenleme formları |
 | `build.ps1`, `Vetra.rc`, `Vetra.manifest`, `Vetra.ico` | MSVC x64 C++20 release derleme betiği ve uygulama kaynakları |
+
+---
+
+## Değişiklik geçmişi
+
+### 2026-11-25
+- **Windows Durum Alanı dock’a eklendi:** Dock’un sağ ucuna (Gizli simgeler `^` ile Masaüstünü göster `|` arasına) **Mikrofon** (aktif kayıt yapan uygulamayı Core Audio `IAudioSessionManager2` ile canlı algılama ve turkuaz gösterge), **Klavye dili** (`TR`/`EN` canlı takip ve yerel seçici panel), **İnternet bağlantısı** (Ethernet / Wi-Fi / Uçak modu / Çevrimdışı), **Ses seviyesi** (sağ tık susturma + fare tekerleği), **Pil ve şarj durumu** (canlı yeşil şarj simgesi ve pil yoksa otomatik gizleme), **Saat ve tarih** (iki satırlı Windows biçimi) ve **Bildirimler** (`Win + N`) eklendi.
+- **Geliştirilmiş Mikrofon ve yeni Klavye dili panelleri:** Mikrofon paneline aktif kayıt yapan uygulama bilgisi, giriş aygıtı (`eCapture`) seçici ve Windows mikrofon gizlilik ayarları kısayolu; Klavye dili paneline yüklü Windows klavye düzenleri listesi ve tek tık geçiş eklendi.
+- **Ayarlar → Durum alanı sekmesi:** Durum alanının genel anahtarı, tüm öğelerin tek tek açılıp kapatılması ve **Mikrofonu yalnızca kullanımda göster** seçeneği eklenip `dock.dat` içine kalıcı olarak bağlandı.
+- **Güvenli görev çubuğu geri yükleme ve derleme akışı:** Vetra çalışırken Windows görev çubuğunu gizler (isteğe bağlı olarak **Ayarlar → Görünüm → Windows görev çubuğunu gizle** ile kapatılabilir); kapandığında veya zorla sonlandırıldığında görev çubuğunu Vetra açılmadan önceki son ayarına (`Vetra.OrigTaskbarState.v1` + iptal olaylı `--restore-taskbar` izleyicisi) yarış durumu olmadan geri döndürür. `build.ps1` derleme öncesi yalnızca ana süreci kapatıp izleyicinin geri yüklemeyi bitirmesini bekler ve derleme sonunda `build\Vetra.exe` dosyasını otomatik yeniden başlatır.

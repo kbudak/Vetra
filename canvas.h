@@ -27,7 +27,7 @@ inline unsigned mixRgb(unsigned first, unsigned second, float amount) {
 
 enum Font { Small, Caption, Body, Strong, Value, Title, Display, Number, Micro, DateBig, ClockBig, TileLabel, FontCount };
 enum Alignment { Left, Center, Right };
-enum Glyph { Logo, FolderIcon, Globe, Terminal, Document, DateIcon, Timer, Check, Chip, Branch, Bag, Trend, Music, Gear, ChevronLeft, ChevronRight, ChevronUp, ChevronDown, Close, Plus, Minus, Play, Pause, Back, Next, Link, Battery, Trash, DiskIcon, Wifi, Speaker, Layers, Sliders, Sun, Cloud, Moon, Rain, Activity, Grip, BluetoothIcon, Plane, Accessibility, Refresh, SearchIcon, HistoryIcon, CropIcon, ScreenIcon, WindIcon, DropIcon, PinIcon, PlaySolid, SkipSolid, MicIcon, HeadphonesIcon };
+enum Glyph { Logo, FolderIcon, Globe, Terminal, Document, DateIcon, Timer, Check, Chip, Branch, Bag, Trend, Music, Gear, ChevronLeft, ChevronRight, ChevronUp, ChevronDown, Close, Plus, Minus, Play, Pause, Back, Next, Link, Battery, Trash, DiskIcon, Wifi, Speaker, Layers, Sliders, Sun, Cloud, Moon, Rain, Activity, Grip, BluetoothIcon, Plane, Accessibility, Refresh, SearchIcon, HistoryIcon, CropIcon, ScreenIcon, WindIcon, DropIcon, PinIcon, PlaySolid, SkipSolid, MicIcon, HeadphonesIcon, EthernetIcon, BellIcon, SpeakerMuted, SpeakerLow, GlobeOff, KeyboardIcon };
 
 struct Draw {
     static ULONG_PTR token;

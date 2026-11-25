@@ -666,7 +666,7 @@ void Dock::scheduleWindowSync() {
 void Dock::completeDeferredStartup() {
     if (startupCompleted || !hwnd) return;
     startupCompleted = true;
-    shellTaskbar.applyAutohide();
+    if (model.hideTaskbar) shellTaskbar.applyAutohide();
     if (model.visibility == DockVisibility::Reserved) {
         for (auto& [mon, res] : reservations) res.verify();
     }
@@ -717,10 +717,15 @@ bool Dock::initialize() {
     registerAppDrop(hwnd);
     trayRestore = RegisterWindowMessageW(L"TaskbarCreated");
     sample();
+    if (model.statusBar.enabled) {
+        if (model.statusBar.keyboard) sampleKeyboardLayout();
+        if (model.statusBar.network) sampleNetworkFast();
+    }
     if (cpu >= 0) cpuAnim.snap(static_cast<float>(cpu));
     ramAnim.snap(static_cast<float>(ram));
     if (battery >= 0) batteryAnim.snap(static_cast<float>(battery));
-    shellTaskbar.start(true);
+    if (model.hideTaskbar) shellTaskbar.start(true);
+    else shellTaskbar.restoreIfOrphaned();
     position();
     refreshAppImages();
     requestWindowIcons();
@@ -979,8 +984,19 @@ bool Dock::layoutMonitorDock(HMONITOR monitor, View& view, RECT& area, RECT& bou
     view.h = Design::DockHeight;
     const int h = px(view.h * view.scale);
     if (model.visibility == DockVisibility::Reserved) {
+        RECT reserveBase = bounds;
+        if (!model.hideTaskbar) {
+            if (const HWND tb = FindWindowW(L"Shell_TrayWnd", nullptr); tb && IsWindowVisible(tb) &&
+                MonitorFromWindow(tb, MONITOR_DEFAULTTONEAREST) == monitor) {
+                RECT tr{};
+                if (GetWindowRect(tb, &tr)) {
+                    if (tr.top >= bounds.bottom - 120) reserveBase.bottom = std::min(reserveBase.bottom, tr.top);
+                    else if (tr.bottom <= bounds.top + 120) reserveBase.top = std::max(reserveBase.top, tr.bottom);
+                }
+            }
+        }
         RECT strip{};
-        if (reservations[monitor].place(hwnd, bounds, model.edge == 0, h + 8, strip)) {
+        if (reservations[monitor].place(hwnd, reserveBase, model.edge == 0, h + 8, strip)) {
             // Include the strip in our layout so the dock and its panels meet at its inner edge.
             area.left = std::max(area.left, strip.left);
             area.right = std::min(area.right, strip.right);
@@ -990,7 +1006,7 @@ bool Dock::layoutMonitorDock(HMONITOR monitor, View& view, RECT& area, RECT& bou
     }
     const float available = (area.right - area.left - 24) / view.scale;
     const float trailing = dockEditMode ? 82.f : 0.f;
-    view.w = Design::DockLeading + Design::DockInset + Design::DockTrailing;
+    view.w = Design::DockLeading + Design::DockInset + trailingWidth();
     const auto& items = dockItems();
     float required = view.w + trailing;
     for (size_t i = 0; i < items.size(); ++i) {
@@ -1036,7 +1052,8 @@ void Dock::position() {
     if (dockDragging || !bar.hwnd || !activeMonitor) return;
     pendingPosition = false;
     invalidateDockItems();
-    if (!nativeBarRevealed && !trayNeedsReveal) shellTaskbar.hide(true);
+    if (model.hideTaskbar && !nativeBarRevealed && !trayNeedsReveal) shellTaskbar.hide(true);
+    else if (!model.hideTaskbar) shellTaskbar.restore();
     if (model.visibility != DockVisibility::Reserved) reservations.clear();
     if (!layoutMonitorDock(activeMonitor, bar, work, monitorRect, dockOrigin, folded)) return;
     if (activeMonitor != animationMonitor) refreshDisplayTiming();
@@ -1089,6 +1106,11 @@ void Dock::positionSheet(bool reopening) {
     if (page == ChromeWindows) sizeChromeWindows((work.right - work.left - 20.f) / dpi);
     if (page == Overflow) { sheet.w = 345; sheet.h = 116 + 40.f * std::min<size_t>(6, folded.size()); }
     if (page == ContextMenu) { sheet.w = 242; sheet.h = 240; }
+    if (page == KeyboardLang) {
+        const int rows = std::clamp(static_cast<int>(extra.keyboardLayouts.size()), 1, 5);
+        sheet.w = 348.f;
+        sheet.h = 154.f + rows * 52.f;
+    }
     if (page == SystemTray) {
         if (trayMenuIconIndex >= 0) {
             sheet.w = 276.f;
@@ -1114,7 +1136,7 @@ void Dock::positionSheet(bool reopening) {
     if (page == Media || page == Git || page == System ||
         page == World || page == Power || page == Volume) sheet.h = 330;
     const bool attached = page == Studio || page == ContextMenu || page == Quick || page == SystemTray ||
-        page == AppMenu || page == Overflow || page == ChromeWindows;
+        page == AppMenu || page == Overflow || page == ChromeWindows || page == KeyboardLang;
     const float availableHeight = (work.bottom - work.top) - (dockHeight + 26.f);
     sheet.scale = std::min({dpi, (work.right - work.left - 20.0f) / sheet.w, availableHeight / sheet.h});
     const int w = px(sheet.w * sheet.scale), h = px(sheet.h * sheet.scale);
@@ -1150,7 +1172,7 @@ void Dock::positionSheet(bool reopening) {
     positionedQuickPage = quickPage;
     POINT origin{x, y};
     if (animate) {
-        const bool compactAnim = page == ContextMenu || page == AppMenu || page == SystemTray || page == ChromeWindows;
+        const bool compactAnim = page == ContextMenu || page == AppMenu || page == SystemTray || page == ChromeWindows || page == KeyboardLang;
         const int slidePx = px((page == Studio ? 14.f : Design::SheetSlidePx) * sheet.scale);
         sheetFrom = {x, model.edge == 0 ? y + slidePx : y - slidePx};
         sheetFromAlpha = .08f;
@@ -1213,6 +1235,11 @@ std::optional<POINT> Dock::advanceSheet(double nowMs) {
 }
 
 void Dock::open(int id, float x, bool focus) {
+    if (const HWND fg = GetForegroundWindow(); fg && IsWindow(fg)) {
+        DWORD pid = 0;
+        GetWindowThreadProcessId(fg, &pid);
+        if (pid && pid != GetCurrentProcessId()) lastExternalFg = fg;
+    }
     if (weatherWidget(id)) id = Weather;
     const bool reopening = sheetClosing && id == page && motionEnabled();
     if (reopening) {
@@ -1253,6 +1280,8 @@ void Dock::open(int id, float x, bool focus) {
     if (id == DayTimeline) { requestWeather(); animateWidgets(); }
     if (id == WhatsApp) { loadApps(); tickProductivity(GetTickCount64()); }
     if (id == Capture || id == OpenWindows) refreshOpenWindows();
+    if (id == KeyboardLang) sampleKeyboardLayout();
+    if (id == MicControl) refreshMicEndpoints();
     if (id == Quick || id == Storage || id == NetworkWidget || id == Volume ||
         id == Power || id == MicControl || weatherWidget(id) || marketWidget(id) || proWidget(id)) sampleExtras(true);
     if (id == Temperature) sample();
@@ -1366,7 +1395,11 @@ void Dock::sample() {
     MEMORYSTATUSEX memory{sizeof(memory)};
     if (GlobalMemoryStatusEx(&memory)) ram = memory.dwMemoryLoad;
     SYSTEM_POWER_STATUS power{};
-    if (GetSystemPowerStatus(&power)) battery = power.BatteryLifePercent == 255 ? -1 : power.BatteryLifePercent;
+    if (GetSystemPowerStatus(&power)) {
+        battery = power.BatteryLifePercent == 255 ? -1 : power.BatteryLifePercent;
+        extra.plugged = power.ACLineStatus == 1;
+        extra.batteryMinutes = power.BatteryLifeTime == DWORD(-1) ? -1 : static_cast<int>(power.BatteryLifeTime / 60);
+    }
     if (shown(Git) || page == Git) branch = currentBranch(model.repo);
     syncMeterTargets();
 }
@@ -2042,7 +2075,7 @@ void Dock::tick(bool pollWindows) {
     const auto t = now();
     const auto stamp = GetTickCount64();
     if (pollWindows) {
-        if (!nativeBarRevealed && !trayNeedsReveal) shellTaskbar.hide();
+        if (model.hideTaskbar && !nativeBarRevealed && !trayNeedsReveal) shellTaskbar.hide();
         if (model.visibility == DockVisibility::Reserved) {
             for (auto& [mon, res] : reservations) res.verify();
         }
@@ -2076,6 +2109,34 @@ void Dock::tick(bool pollWindows) {
     dataChanged |= tickMarket();
     const bool timersChanged = updateTimers(stamp);
     bool sampled = false;
+    const float prevStatusW = statusBarWidth();
+    if (model.statusBar.enabled && model.statusBar.keyboard) {
+        const HKL prevHkl = extra.activeKeyboardHkl;
+        const Text prevShort = extra.keyboardShort, prevSub = extra.keyboardSub;
+        sampleKeyboardLayout();
+        if (extra.activeKeyboardHkl != prevHkl || extra.keyboardShort != prevShort || extra.keyboardSub != prevSub)
+            sampled = true;
+    }
+    if (model.statusBar.enabled && (!extra.lastStatusFastAt || stamp - extra.lastStatusFastAt >= 2000)) {
+        extra.lastStatusFastAt = stamp;
+        const int prevBat = battery, prevMic = extra.microphoneMute;
+        const auto prevApps = extra.micActiveApps;
+        const bool prevPlug = extra.plugged, prevEth = extra.netEthernetFast, prevWifi = extra.netWifiFast;
+        if (model.statusBar.microphone) sampleMicrophone();
+        if (model.statusBar.network) sampleNetworkFast();
+        if (model.statusBar.battery) {
+            SYSTEM_POWER_STATUS power{};
+            if (GetSystemPowerStatus(&power)) {
+                battery = power.BatteryLifePercent == 255 ? -1 : power.BatteryLifePercent;
+                extra.plugged = power.ACLineStatus == 1;
+                extra.batteryMinutes = power.BatteryLifeTime == DWORD(-1) ? -1 : static_cast<int>(power.BatteryLifeTime / 60);
+                syncMeterTargets();
+            }
+        }
+        if (battery != prevBat || extra.plugged != prevPlug || extra.microphoneMute != prevMic ||
+            extra.micActiveApps != prevApps || extra.netEthernetFast != prevEth || extra.netWifiFast != prevWifi)
+            sampled = true;
+    }
     static ULONGLONG lastCpuTick = 0;
     const bool cpuWidgetVisible = shown(System) || page == System || shown(CpuMeter) || shown(RamMeter) ||
         shown(Temperature) || page == Temperature;
@@ -2102,6 +2163,8 @@ void Dock::tick(bool pollWindows) {
             sampled = true;
         }
     }
+    if (std::abs(statusBarWidth() - prevStatusW) > 0.5f) pendingPosition = true;
+    const bool repositionNow = reposition || (pendingPosition && !dockVisSpring.active(0.001f, 0.006f) && !dockDragging && !dockOrderDragging);
     const bool noticeExpired = !notice.empty() && stamp >= noticeUntil;
     if (noticeExpired) { notice.clear(); noticeAtMs = 0.0; }
     else if (!notice.empty() && noticeUntil > stamp && noticeUntil - stamp <= 350 && motionEnabled()) startAnimTimer();
@@ -2110,12 +2173,12 @@ void Dock::tick(bool pollWindows) {
     const bool livePanel = page == Clock || page == Calendar || page == System || page == Git ||
         page == Media || page == OpenWindows || page == Capture || page == Volume || page == MicControl || page == Power ||
         page == NetworkWidget || page == Storage || page == Quick || page == Stopwatch || page == World ||
-        page == Usage || page == DayTimeline || page == Currency || page == WhatsApp ||
+        page == Usage || page == DayTimeline || page == Currency || page == WhatsApp || page == KeyboardLang ||
         page == RecycleBin || weatherWidget(page) || marketWidget(page) || proWidget(page) || page == Overflow;
     const bool sheetDirty = noticeExpired || (page == Clock && secondChanged) ||
         ((page == Countdown || page == Focus) && timersChanged) ||
         (livePanel && (dataChanged || sampled || winState || minuteChanged));
-    if (reposition) position();
+    if (repositionNow) position();
     else {
         if (barDirty && anyDockVisible()) paintBar();
         if (chromeChanged) positionSheet();
@@ -2130,7 +2193,7 @@ void Dock::menu() {
 }
 void Dock::openOverflow() {
     if (folded.empty()) return;
-    open(Overflow, bar.w - Design::DockTrailing - Design::DockInset - Design::CardHeight / 2 - (dockEditMode ? 82 : 0));
+    open(Overflow, bar.w - trailingWidth() - Design::DockInset - Design::CardHeight / 2 - (dockEditMode ? 82 : 0));
 }
 void Dock::showSystemQuick() { requestNativeFlyout(NativeFlyout::Quick); }
 
@@ -2226,7 +2289,7 @@ LRESULT Dock::message(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     if (isOwner && trayRestore && msg == trayRestore) {
         reservations.clear();
         tray(true);
-        shellTaskbar.start();
+        if (model.hideTaskbar) shellTaskbar.start();
         position();
         return 0;
     }
@@ -2596,16 +2659,22 @@ LRESULT Dock::message(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_MOUSEWHEEL:
-        if (isBar && !dockEditMode && width(barVolumeCard) > 0.f) {
+        if (isBar && !dockEditMode && (width(barVolumeCard) > 0.f || width(statusVolumeHit) > 0.f || width(statusKeyboardHit) > 0.f)) {
             POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
             ScreenToClient(w, &pt);
             const float lx = pt.x / bar.scale, ly = pt.y / bar.scale;
-            if (lx >= barVolumeCard.left && lx < barVolumeCard.right &&
-                ly >= barVolumeCard.top && ly < barVolumeCard.bottom) {
+            const auto inBox = [lx, ly](Box b) {
+                return width(b) > 0.f && lx >= b.left && lx < b.right && ly >= b.top && ly < b.bottom;
+            };
+            if (inBox(barVolumeCard) || inBox(statusVolumeHit)) {
                 const float step = GET_WHEEL_DELTA_WPARAM(wp) > 0 ? 0.04f : -0.04f;
                 const float base = barVolumeTarget >= 0.f ? barVolumeTarget :
                     (extra.volume >= 0 ? extra.volume / 100.f : 0.f);
                 setVolumeLevel(std::clamp(base + step, 0.f, 1.f), false);
+                return 0;
+            }
+            if (inBox(statusKeyboardHit)) {
+                cycleKeyboardLayout(GET_WHEEL_DELTA_WPARAM(wp) > 0 ? -1 : 1);
                 return 0;
             }
         }
@@ -2642,7 +2711,7 @@ LRESULT Dock::message(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         if (!isBar && (page == Tasks || page == Calendar || page == Clock || page == Sales || page == Growth || page == Quick ||
             page == OpenWindows || page == Storage || page == Stopwatch || page == Studio || page == SystemTray ||
             page == Apps || page == AppMenu || page == Recent || page == Search || page == Commands || page == Capture ||
-            page == Overflow || page == ChromeWindows || page == Usage)) {
+            page == Overflow || page == ChromeWindows || page == Usage || page == KeyboardLang || page == MicControl)) {
             const int delta = GET_WHEEL_DELTA_WPARAM(wp) > 0 ? -1 : 1;
             if (page == Studio) {
                 if (tab == 0) orderPage = std::max(0, orderPage + delta);
@@ -2765,6 +2834,13 @@ LRESULT Dock::message(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             KillTimer(hwnd, WindowSyncTick);
             windowSyncScheduled = false;
             const int winState = refreshOpenWindows();
+            bool kbChanged = false;
+            if (model.statusBar.enabled && model.statusBar.keyboard) {
+                const HKL prevHkl = extra.activeKeyboardHkl;
+                const Text prevShort = extra.keyboardShort, prevSub = extra.keyboardSub;
+                sampleKeyboardLayout();
+                kbChanged = extra.activeKeyboardHkl != prevHkl || extra.keyboardShort != prevShort || extra.keyboardSub != prevSub;
+            }
             if (winState) invalidateDockItems();
             if (winState == 2) pendingPosition = true;
             bool chromeChanged = false;
@@ -2778,9 +2854,11 @@ LRESULT Dock::message(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             if (pendingPosition && !dockVisSpring.active(0.001f, 0.006f) && !dockDragging && !dockOrderDragging) {
                 position();
             } else {
-                if (winState && anyDockVisible()) paintBar();
+                if ((winState || kbChanged) && anyDockVisible()) paintBar();
                 if (chromeChanged) positionSheet();
                 else if (winState && panel && !sheetClosing && (page == OpenWindows || page == Capture || page == Overflow))
+                    paintSheet();
+                else if (kbChanged && panel && !sheetClosing && page == KeyboardLang)
                     paintSheet();
             }
             if (panel && page == ChromeWindows && !sheetClosing) updateChromePreviews();

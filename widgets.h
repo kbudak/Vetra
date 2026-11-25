@@ -121,7 +121,15 @@ struct RadioStatus {
     bool airplane = false;
     Text network;
     GUID adapter{};
-    bool denied = false, ethernet = false;
+    bool denied = false, ethernet = false, hasInternet = false;
+};
+struct KeyboardLayoutInfo {
+    HKL hkl{};
+    Text shortCode;
+    Text subCode;
+    Text languageName;
+    Text layoutName;
+    bool active = false;
 };
 struct WeatherDay { int day, high, low, code; Text sunrise, sunset; };
 struct WeatherHour { Text time; int temp, code; bool daylight; };
@@ -214,6 +222,14 @@ struct ExtraWidgets {
     ULONGLONG watchStart = 0, watchAccum = 0;
     int volume = -1, usageTotal = 0;
     int microphoneMute = -1;
+    Text micDeviceName;
+    std::vector<Text> micActiveApps;
+    std::vector<AudioEndpointInfo> micDevices;
+    std::vector<KeyboardLayoutInfo> keyboardLayouts;
+    HKL activeKeyboardHkl{};
+    Text keyboardShort, keyboardSub;
+    bool netEthernetFast = false, netWifiFast = false;
+    ULONGLONG lastRadioPollAt = 0, lastStatusFastAt = 0;
     Text outputName;
     ULONGLONG mediaProgressPaintAt = 0;
     bool muted = false, plugged = false, usageDirty = false;

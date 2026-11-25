@@ -160,6 +160,12 @@ void Model::load() {
             if (row >> enabled && enabled) visibility = DockVisibility::Reserved;
         } else if (type == "accent") {
             row >> accent;
+        } else if (type == "statusBar") {
+            row >> statusBar.enabled >> statusBar.microphone >> statusBar.micOnlyInUse
+                >> statusBar.keyboard >> statusBar.network >> statusBar.volume
+                >> statusBar.battery >> statusBar.clock >> statusBar.notifications;
+        } else if (type == "taskbar") {
+            row >> hideTaskbar;
         } else if (type == "widgets") {
             row >> countdownMinutes >> worldCity >> weatherCity;
         } else if (type == "market") {
@@ -335,6 +341,10 @@ bool Model::save() const {
     out << "Vetra 1\nappearance " << profile << ' ' << theme << ' ' << (48 + (opacity * 52 + 50) / 100) << ' ' << size << ' ' << edge << ' '
         << alignment << " 0 0 " << topmost << " 1 " << focusMinutes << ' ' << glassTheme(theme) << ' ' << autoHides() << ' ' << opacity << ' ' << (visibility == DockVisibility::Reserved) << '\n';
     out << "accent " << accent << '\n';
+    out << "statusBar " << statusBar.enabled << ' ' << statusBar.microphone << ' ' << statusBar.micOnlyInUse
+        << ' ' << statusBar.keyboard << ' ' << statusBar.network << ' ' << statusBar.volume
+        << ' ' << statusBar.battery << ' ' << statusBar.clock << ' ' << statusBar.notifications << '\n';
+    out << "taskbar " << hideTaskbar << '\n';
     out << "widgets " << countdownMinutes << ' ' << worldCity << ' ' << weatherCity << '\n';
     out << "market";
     for (const auto& symbol : stockSymbols) out << ' ' << std::quoted(utf8(symbol));

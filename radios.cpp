@@ -275,8 +275,21 @@ void Dock::queryRadios(int toggle) {
                 status.airplane = readSystemAirplaneMode();
             }
             try {
+                if (const auto internet = NetworkInformation::GetInternetConnectionProfile()) {
+                    const auto level = internet.GetNetworkConnectivityLevel();
+                    if (level == NetworkConnectivityLevel::InternetAccess) status.hasInternet = true;
+                    const auto adapter = internet.NetworkAdapter();
+                    if (internet.IsWlanConnectionProfile() && status.network.empty()) {
+                        status.network = internet.ProfileName().c_str();
+                        if (adapter) status.adapter = adapter.NetworkAdapterId();
+                    } else if (adapter && adapter.IanaInterfaceType() == 6 && level != NetworkConnectivityLevel::None) {
+                        status.ethernet = true;
+                    }
+                }
                 for (const auto& profile : NetworkInformation::GetConnectionProfiles()) {
-                    if (profile.GetNetworkConnectivityLevel() == NetworkConnectivityLevel::None) continue;
+                    const auto level = profile.GetNetworkConnectivityLevel();
+                    if (level == NetworkConnectivityLevel::None) continue;
+                    if (level == NetworkConnectivityLevel::InternetAccess) status.hasInternet = true;
                     const auto adapter = profile.NetworkAdapter();
                     if (profile.IsWlanConnectionProfile() && status.network.empty()) {
                         status.network = profile.ProfileName().c_str();
