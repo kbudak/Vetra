@@ -7,6 +7,10 @@
 *.lib
 *.tmp
 *.log
+*.dat
+ai_usage.json
+.env
+.env.*
 .vs/
 .vscode/
 Thumbs.db
