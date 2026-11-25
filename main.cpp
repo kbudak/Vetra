@@ -720,6 +720,7 @@ bool Dock::initialize() {
     if (model.statusBar.enabled) {
         if (model.statusBar.keyboard) sampleKeyboardLayout();
         if (model.statusBar.network) sampleNetworkFast();
+        if (model.statusBar.notifications) queryDoNotDisturb();
     }
     if (cpu >= 0) cpuAnim.snap(static_cast<float>(cpu));
     ramAnim.snap(static_cast<float>(ram));
@@ -1111,6 +1112,18 @@ void Dock::positionSheet(bool reopening) {
         sheet.w = 348.f;
         sheet.h = 154.f + rows * 52.f;
     }
+    if (page == NotificationCenter) {
+        sheet.w = 384.f;
+        sheet.h = extra.notifCalExpanded ? 662.f : 400.f;
+    }
+    if (page == NetworkPanel) {
+        sheet.w = 408.f;
+        sheet.h = 404.f;
+    }
+    if (page == Volume) {
+        sheet.w = 408.f;
+        sheet.h = 376.f;
+    }
     if (page == SystemTray) {
         if (trayMenuIconIndex >= 0) {
             sheet.w = 276.f;
@@ -1134,9 +1147,9 @@ void Dock::positionSheet(bool reopening) {
     }
     if (page == Focus || page == Countdown) sheet.h = 424;
     if (page == Media || page == Git || page == System ||
-        page == World || page == Power || page == Volume) sheet.h = 330;
+        page == World || page == Power) sheet.h = 330;
     const bool attached = page == Studio || page == ContextMenu || page == Quick || page == SystemTray ||
-        page == AppMenu || page == Overflow || page == ChromeWindows || page == KeyboardLang;
+        page == AppMenu || page == Overflow || page == ChromeWindows || page == KeyboardLang || page == NotificationCenter || page == NetworkPanel || page == Volume;
     const float availableHeight = (work.bottom - work.top) - (dockHeight + 26.f);
     sheet.scale = std::min({dpi, (work.right - work.left - 20.0f) / sheet.w, availableHeight / sheet.h});
     const int w = px(sheet.w * sheet.scale), h = px(sheet.h * sheet.scale);
@@ -1172,7 +1185,7 @@ void Dock::positionSheet(bool reopening) {
     positionedQuickPage = quickPage;
     POINT origin{x, y};
     if (animate) {
-        const bool compactAnim = page == ContextMenu || page == AppMenu || page == SystemTray || page == ChromeWindows || page == KeyboardLang;
+        const bool compactAnim = page == ContextMenu || page == AppMenu || page == SystemTray || page == ChromeWindows || page == KeyboardLang || page == NotificationCenter || page == NetworkPanel || page == Volume;
         const int slidePx = px((page == Studio ? 14.f : Design::SheetSlidePx) * sheet.scale);
         sheetFrom = {x, model.edge == 0 ? y + slidePx : y - slidePx};
         sheetFromAlpha = .08f;
@@ -1270,7 +1283,10 @@ void Dock::open(int id, float x, bool focus) {
         queryMedia();
     }
     cityPicker = false;
-    if (id == Calendar || id == Clock) selected = month = Date::from(now());
+    if (id == Calendar || id == Clock || id == NotificationCenter) selected = month = Date::from(now());
+    if (id == NotificationCenter) refreshNotifications(true);
+    if (id == NetworkPanel) { sampleNetworkFast(); refreshWifi(true, true); queryRadios(); }
+    if (id == Volume) refreshAudioEndpoints();
     if (id == Git) branch = currentBranch(model.repo);
     if (typingTool) loadApps();
     if (id == Recent) loadRecentFiles();
@@ -2173,10 +2189,10 @@ void Dock::tick(bool pollWindows) {
     const bool livePanel = page == Clock || page == Calendar || page == System || page == Git ||
         page == Media || page == OpenWindows || page == Capture || page == Volume || page == MicControl || page == Power ||
         page == NetworkWidget || page == Storage || page == Quick || page == Stopwatch || page == World ||
-        page == Usage || page == DayTimeline || page == Currency || page == WhatsApp || page == KeyboardLang ||
+        page == Usage || page == DayTimeline || page == Currency || page == WhatsApp || page == KeyboardLang || page == NotificationCenter || page == NetworkPanel ||
         page == RecycleBin || weatherWidget(page) || marketWidget(page) || proWidget(page) || page == Overflow;
     const bool sheetDirty = noticeExpired || (page == Clock && secondChanged) ||
-        ((page == Countdown || page == Focus) && timersChanged) ||
+        ((page == Countdown || page == Focus || page == NotificationCenter) && timersChanged) ||
         (livePanel && (dataChanged || sampled || winState || minuteChanged));
     if (repositionNow) position();
     else {
@@ -2510,7 +2526,7 @@ LRESULT Dock::message(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                 return 0;
             }
         }
-        if (!isBar && page == Quick && extra.quickSub == QuickSubPanel::Main && extra.volume >= 0 && width(quickVolumeTrack) > 0.f) {
+        if (!isBar && ((page == Quick && extra.quickSub == QuickSubPanel::Main) || page == Volume) && extra.volume >= 0 && width(quickVolumeTrack) > 0.f) {
             const float x = GET_X_LPARAM(lp) / v.scale, y = GET_Y_LPARAM(lp) / v.scale;
             if (x >= quickVolumeTrack.left - 8.f && x <= quickVolumeTrack.right + 8.f &&
                 y >= quickVolumeTrack.top - 10.f && y <= quickVolumeTrack.bottom + 10.f) {
@@ -2695,7 +2711,7 @@ LRESULT Dock::message(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                 return 0;
             }
         }
-        if (!isBar && page == Quick && extra.quickSub == QuickSubPanel::Main && width(quickVolumeTrack) > 0.f) {
+        if (!isBar && ((page == Quick && extra.quickSub == QuickSubPanel::Main) || page == Volume) && width(quickVolumeTrack) > 0.f) {
             POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
             ScreenToClient(w, &pt);
             const float lx = pt.x / sheet.scale, ly = pt.y / sheet.scale;
@@ -2711,7 +2727,7 @@ LRESULT Dock::message(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         if (!isBar && (page == Tasks || page == Calendar || page == Clock || page == Sales || page == Growth || page == Quick ||
             page == OpenWindows || page == Storage || page == Stopwatch || page == Studio || page == SystemTray ||
             page == Apps || page == AppMenu || page == Recent || page == Search || page == Commands || page == Capture ||
-            page == Overflow || page == ChromeWindows || page == Usage || page == KeyboardLang || page == MicControl)) {
+            page == Overflow || page == ChromeWindows || page == Usage || page == KeyboardLang || page == MicControl || page == NotificationCenter || page == NetworkPanel || page == Volume)) {
             const int delta = GET_WHEEL_DELTA_WPARAM(wp) > 0 ? -1 : 1;
             if (page == Studio) {
                 if (tab == 0) orderPage = std::max(0, orderPage + delta);
@@ -2885,7 +2901,7 @@ LRESULT Dock::message(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             if (anyDockVisible() && (changed || (motionEnabled() &&
                 ((focusTimer.running() && visible(Focus)) || (countdownTimer.running() && visible(Countdown)) ||
                     (extra.watchStart && visible(Stopwatch)))))) paintBar();
-            if ((page == Focus || page == Countdown || page == Stopwatch) &&
+            if ((page == Focus || page == Countdown || page == Stopwatch || page == NotificationCenter) &&
                 (changed || (motionEnabled() && active))) paintSheet();
             if (!active) KillTimer(hwnd, SessionTimerTick);
         }

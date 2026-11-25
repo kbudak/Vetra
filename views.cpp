@@ -389,7 +389,7 @@ void Dock::paintSheet(const POINT* origin) {
     sheet.hits.clear();
     quickVolumeTrack = {};
     Palette p(model);
-    const bool compact = page == ContextMenu || page == AppMenu || page == SystemTray || page == ChromeWindows || page == KeyboardLang;
+    const bool compact = page == ContextMenu || page == AppMenu || page == SystemTray || page == ChromeWindows || page == KeyboardLang || page == NotificationCenter || page == NetworkPanel || page == Volume;
     const auto surface = box(6, 4, sheet.w - 12, sheet.h - 12);
     if (page == Studio) {
         p.glass = false;
@@ -401,7 +401,7 @@ void Dock::paintSheet(const POINT* origin) {
         d.fill(surface, 18, tint(p.base));
         d.outline(inset(surface, .5f), 17.5f, tint(p.line, .30f));
     } else p.surface(d, surface, compact ? 20.f : p.glass ? 22.f : 24.f);
-    if (page == AppMenu || page == ContextMenu || page == SystemTray || page == Overflow || page == ChromeWindows || page == KeyboardLang) {
+    if (page == AppMenu || page == ContextMenu || page == SystemTray || page == Overflow || page == ChromeWindows || page == KeyboardLang || page == NotificationCenter || page == NetworkPanel || page == Volume) {
         const float bottom = model.edge == 0 ? sheet.h - 8 : 5;
         d.fill(box(sheetTail - 11, bottom - 1.f, 22, 2), 1.f, tint(p.accent, p.glass ? .32f : .68f));
     }
@@ -410,6 +410,8 @@ void Dock::paintSheet(const POINT* origin) {
     case Overflow: overflowPanel(p); break;
     case ChromeWindows: chromeWindowsPanel(p); break;
     case KeyboardLang: keyboardPanel(p); break;
+    case NotificationCenter: notificationPanel(p); break;
+    case NetworkPanel: networkPanel(p); break;
     case Quick:
         extraPanel(p);
         break;
@@ -1242,11 +1244,11 @@ void Dock::studio(Palette p) {
             {MicIcon, L"Mikrofon göstergesi", L"Aktif kayıt rengi, hızlı susturma (sağ tık) ve giriş seçici", &sb.microphone, false},
             {MicIcon, L"Mikrofonu yalnızca kullanımda göster", L"Bir uygulama mikrofonu kullandığında veya susturulduğunda görünür", &sb.micOnlyInUse, true},
             {KeyboardIcon, L"Klavye dili", L"Aktif klavye düzeni (TR/EN), tek tık seçici ve sağ tık/tekerlek geçişi", &sb.keyboard, false},
-            {EthernetIcon, L"İnternet bağlantısı", L"Ethernet, Wi-Fi veya çevrimdışı durum simgesi ve Denetim Merkezi", &sb.network, false},
-            {Speaker, L"Ses seviyesi", L"Dinamik hoparlör simgesi, sağ tık susturma ve tekerlekle ses ayarı", &sb.volume, false},
+            {EthernetIcon, L"İnternet bağlantısı", L"Ethernet/Wi-Fi simgesi ve özel İnternet paneli", &sb.network, false},
+            {Speaker, L"Ses seviyesi", L"Özel Ses & çıkış aygıtı paneli, sağ tık susturma ve tekerlek ayarı", &sb.volume, false},
             {Battery, L"Pil ve şarj durumu", L"Doluluk ve şarj simgesi (pil algılanmazsa otomatik gizlenir)", &sb.battery, false},
-            {Timer, L"Saat ve tarih", L"Windows tarzı iki satırlı saat ve tarih (tıklayınca Takvim açılır)", &sb.clock, false},
-            {BellIcon, L"Bildirimler", L"Windows Bildirim Merkezi düğmesi (Win + N)", &sb.notifications, false},
+            {Timer, L"Saat ve tarih", L"İki satırlı saat/tarih (tıklayınca Vetra Bildirim & Takvim panelini açar)", &sb.clock, false},
+            {BellIcon, L"Bildirimler", L"Vetra yerel Bildirim Merkezi, Rahatsız Etmeyin, Takvim ve Odaklanma paneli", &sb.notifications, false},
         };
         const float rowAlpha = sb.enabled ? 1.f : .45f;
         for (int i = 0; i < static_cast<int>(ARRAYSIZE(rows)); ++i) {

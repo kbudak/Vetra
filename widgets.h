@@ -131,6 +131,17 @@ struct KeyboardLayoutInfo {
     Text layoutName;
     bool active = false;
 };
+struct WinNotification {
+    int64_t id = 0;
+    int64_t arrivalTime = 0;
+    Text aumid;
+    Text appName;
+    Text title;
+    Text body;
+    Text timeLabel;
+    Text launchUri;
+    std::shared_ptr<Gdiplus::Bitmap> icon;
+};
 struct WeatherDay { int day, high, low, code; Text sunrise, sunset; };
 struct WeatherHour { Text time; int temp, code; bool daylight; };
 struct Forecast {
@@ -229,7 +240,13 @@ struct ExtraWidgets {
     HKL activeKeyboardHkl{};
     Text keyboardShort, keyboardSub;
     bool netEthernetFast = false, netWifiFast = false;
-    ULONGLONG lastRadioPollAt = 0, lastStatusFastAt = 0;
+    ULONGLONG lastRadioPollAt = 0, lastStatusFastAt = 0, lastNotifPollAt = 0;
+    std::vector<WinNotification> notifications;
+    std::future<std::vector<WinNotification>> notifRequest;
+    std::vector<int64_t> dismissedNotifIds;
+    int64_t clearedNotifBefore = 0;
+    bool dndEnabled = false;
+    bool notifCalExpanded = true;
     Text outputName;
     ULONGLONG mediaProgressPaintAt = 0;
     bool muted = false, plugged = false, usageDirty = false;

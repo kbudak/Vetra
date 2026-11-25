@@ -978,12 +978,16 @@ void Draw::icon(Glyph glyph, Box b, Color c) {
     case Trash: p({{7, 8}, {8, 20}, {16, 20}, {17, 8}}); l(4, 7, 20, 7); l(9, 4, 15, 4); break;
     case DiskIcon: rect(2.5f, 6, 19, 13, 3); l(4, 13, 20, 13); circle(17.5f, 16.2f, 1.25f, c); break;
     case Wifi:
-        arc(box(-1.5f, 6.f, 27.f, 27.f), 228.f, 84.f, c, 1.65f);
-        arc(box(3.f, 10.5f, 18.f, 18.f), 226.f, 88.f, c, 1.65f);
-        arc(box(7.2f, 14.7f, 9.6f, 9.6f), 222.f, 96.f, c, 1.65f);
-        circle(12.f, 19.2f, 1.45f, c);
+        arc(box(-1.5f, 5.5f, 27.f, 27.f), 228.f, 84.f, c, 1.85f);
+        arc(box(3.f, 10.f, 18.f, 18.f), 226.f, 88.f, c, 1.85f);
+        arc(box(7.2f, 14.2f, 9.6f, 9.6f), 222.f, 96.f, c, 1.85f);
+        circle(12.f, 19.2f, 1.65f, c);
         break;
-    case Speaker: p({{3,9},{7,9},{12,5},{12,19},{7,15},{3,15},{3,9}}); p({{16,8},{18,12},{16,16}}); p({{19,5},{22,12},{19,19}}); break;
+    case Speaker:
+        p({{2.5f, 9.f}, {6.5f, 9.f}, {11.5f, 4.8f}, {11.5f, 19.2f}, {6.5f, 15.f}, {2.5f, 15.f}, {2.5f, 9.f}});
+        arc(box(10.5f, 7.f, 7.5f, 10.f), -52.f, 104.f, c, 1.8f);
+        arc(box(11.f, 4.f, 11.f, 16.f), -54.f, 108.f, c, 1.8f);
+        break;
     case MicIcon:
         rect(9, 2.5f, 6, 12, 3); p({{5.5f, 11}, {5.5f, 13.5f}, {7.5f, 17}, {12, 18.5f},
             {16.5f, 17}, {18.5f, 13.5f}, {18.5f, 11}});
@@ -1046,31 +1050,29 @@ void Draw::icon(Glyph glyph, Box b, Color c) {
         p({{12, 3}, {20, 11}, {16, 12}, {13, 16}, {13, 19}, {5, 11}, {8, 11}, {12, 7}, {12, 3}});
         l(9, 15, 3, 21); break;
     case EthernetIcon:
-        // Windows 11 style monitor + RJ45 cable plug
-        p({{13.5f, 16.5f}, {3.5f, 16.5f}, {3.5f, 5.f}, {13.5f, 5.f}});
-        l(6.5f, 19.5f, 13.5f, 19.5f);
-        l(9.5f, 16.5f, 9.5f, 19.5f);
-        rect(15.f, 4.f, 6.f, 7.5f, 1.2f);
-        l(18.f, 11.5f, 18.f, 20.f);
-        l(17.f, 6.5f, 17.f, 8.5f);
-        l(19.f, 6.5f, 19.f, 8.5f);
+        // Clean, crisp Windows 11 monitor + RJ45 plug with generous separation
+        outline(box(2.f, 4.5f, 12.f, 10.5f), 2.f, c, 1.75f);
+        line(8.f, 15.f, 8.f, 19.f, c, 1.75f);
+        line(4.5f, 19.f, 11.5f, 19.f, c, 1.75f);
+        outline(box(16.5f, 4.5f, 5.5f, 7.f), 1.3f, c, 1.75f);
+        line(19.25f, 11.5f, 19.25f, 19.5f, c, 1.75f);
         break;
     case BellIcon:
-        arc(box(6.f, 4.f, 12.f, 12.f), 180.f, 180.f, c, 1.65f);
+        arc(box(6.f, 4.f, 12.f, 12.f), 180.f, 180.f, c, 1.7f);
         l(6.f, 10.f, 5.f, 16.f);
         l(18.f, 10.f, 19.f, 16.f);
         l(3.5f, 16.5f, 20.5f, 16.5f);
-        arc(box(9.5f, 17.f, 5.f, 4.f), 0.f, 180.f, c, 1.6f);
+        arc(box(9.5f, 17.f, 5.f, 4.f), 0.f, 180.f, c, 1.65f);
         l(12.f, 2.5f, 12.f, 4.f);
         break;
     case SpeakerMuted:
-        p({{3,9},{7,9},{12,5},{12,19},{7,15},{3,15},{3,9}});
-        l(15.5f, 9.f, 21.f, 15.f);
-        l(21.f, 9.f, 15.5f, 15.f);
+        p({{2.5f, 9.f}, {6.5f, 9.f}, {11.5f, 4.8f}, {11.5f, 19.2f}, {6.5f, 15.f}, {2.5f, 15.f}, {2.5f, 9.f}});
+        line(15.5f, 9.2f, 21.f, 14.8f, c, 1.8f);
+        line(21.f, 9.2f, 15.5f, 14.8f, c, 1.8f);
         break;
     case SpeakerLow:
-        p({{3,9},{7,9},{12,5},{12,19},{7,15},{3,15},{3,9}});
-        p({{16,9},{18,12},{16,15}});
+        p({{2.5f, 9.f}, {6.5f, 9.f}, {11.5f, 4.8f}, {11.5f, 19.2f}, {6.5f, 15.f}, {2.5f, 15.f}, {2.5f, 9.f}});
+        arc(box(11.f, 7.f, 7.5f, 10.f), -52.f, 104.f, c, 1.8f);
         break;
     case GlobeOff:
         o(11.f, 11.5f, 7.5f);

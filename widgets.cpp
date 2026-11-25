@@ -1151,6 +1151,322 @@ void Dock::cycleKeyboardLayout(int delta) {
     const int next = ((cur + (delta >= 0 ? 1 : -1)) % n + n) % n;
     switchKeyboardLayout(extra.keyboardLayouts[next].hkl);
 }
+
+namespace {
+constexpr uint64_t WnfQuietHoursProfile = 0x0D83063EA3BF1C75ULL;
+
+using NtQueryWnfStateDataFn = LONG(NTAPI*)(const uint64_t*, const void*, const void*, ULONG*, void*, ULONG*);
+using NtUpdateWnfStateDataFn = LONG(NTAPI*)(const uint64_t*, const void*, ULONG, const void*, const void*, ULONG, ULONG);
+
+int readWindowsDndProfile() {
+    static auto fn = reinterpret_cast<NtQueryWnfStateDataFn>(
+        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryWnfStateData"));
+    if (!fn) return 0;
+    ULONG stamp = 0, size = sizeof(int32_t);
+    int32_t value = 0;
+    if (fn(&WnfQuietHoursProfile, nullptr, nullptr, &stamp, &value, &size) == 0 && size >= sizeof(int32_t))
+        return value;
+    return 0;
+}
+
+bool writeWindowsDndProfile(int32_t value) {
+    static auto fn = reinterpret_cast<NtUpdateWnfStateDataFn>(
+        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtUpdateWnfStateData"));
+    if (!fn) return false;
+    return fn(&WnfQuietHoursProfile, &value, sizeof(value), nullptr, nullptr, 0, 0) == 0;
+}
+
+Text decodeXmlEntities(const Text& in) {
+    Text out;
+    out.reserve(in.size());
+    for (size_t i = 0; i < in.size(); ++i) {
+        if (in[i] == L'&') {
+            const size_t semi = in.find(L';', i + 1);
+            if (semi != Text::npos && semi - i <= 10) {
+                const Text ent = in.substr(i + 1, semi - i - 1);
+                if (ent == L"amp") { out += L'&'; i = semi; continue; }
+                if (ent == L"lt") { out += L'<'; i = semi; continue; }
+                if (ent == L"gt") { out += L'>'; i = semi; continue; }
+                if (ent == L"quot") { out += L'"'; i = semi; continue; }
+                if (ent == L"apos") { out += L'\''; i = semi; continue; }
+                if (ent.size() >= 2 && ent[0] == L'#') {
+                    const unsigned code = ent[1] == L'x' || ent[1] == L'X'
+                        ? static_cast<unsigned>(wcstoul(ent.c_str() + 2, nullptr, 16))
+                        : static_cast<unsigned>(wcstoul(ent.c_str() + 1, nullptr, 10));
+                    if (code > 0 && code < 0x10000u) { out += static_cast<wchar_t>(code); i = semi; continue; }
+                }
+            }
+        }
+        out += in[i];
+    }
+    return out;
+}
+
+void parseToastPayload(const std::string& raw, Text& outTitle, Text& outBody, Text& outLaunchUri) {
+    const Text xml = utf16(raw);
+    std::vector<Text> lines;
+    size_t pos = 0;
+    while ((pos = xml.find(L"<text", pos)) != Text::npos) {
+        const size_t gt = xml.find(L'>', pos);
+        if (gt == Text::npos) break;
+        if (gt > pos && xml[gt - 1] == L'/') { pos = gt + 1; continue; }
+        const size_t close = xml.find(L"</text>", gt + 1);
+        if (close == Text::npos) break;
+        Text t = decodeXmlEntities(xml.substr(gt + 1, close - gt - 1));
+        while (!t.empty() && (t.front() == L' ' || t.front() == L'\r' || t.front() == L'\n' || t.front() == L'\t')) t.erase(t.begin());
+        while (!t.empty() && (t.back() == L' ' || t.back() == L'\r' || t.back() == L'\n' || t.back() == L'\t')) t.pop_back();
+        if (!t.empty()) lines.push_back(std::move(t));
+        pos = close + 7;
+    }
+    if (!lines.empty()) outTitle = lines[0];
+    if (lines.size() >= 2) {
+        outBody = lines[1];
+        for (size_t i = 2; i < lines.size() && i < 4; ++i) outBody += L" · " + lines[i];
+    }
+    // Extract protocol launch URI if activationType="protocol"
+    const size_t toastPos = xml.find(L"<toast");
+    if (toastPos != Text::npos) {
+        const size_t toastEnd = xml.find(L'>', toastPos);
+        if (toastEnd != Text::npos) {
+            const Text tag = xml.substr(toastPos, toastEnd - toastPos);
+            if (tag.find(L"activationType=\"protocol\"") != Text::npos) {
+                const size_t lp = tag.find(L"launch=\"");
+                if (lp != Text::npos) {
+                    const size_t le = tag.find(L'"', lp + 8);
+                    if (le != Text::npos) outLaunchUri = decodeXmlEntities(tag.substr(lp + 8, le - lp - 8));
+                }
+            }
+        }
+    }
+}
+
+Text formatNotifTime(int64_t fileTimeVal) {
+    if (fileTimeVal <= 0) return {};
+    FILETIME ft{};
+    ft.dwLowDateTime = static_cast<DWORD>(fileTimeVal & 0xFFFFFFFFULL);
+    ft.dwHighDateTime = static_cast<DWORD>((static_cast<uint64_t>(fileTimeVal) >> 32) & 0xFFFFFFFFULL);
+    FILETIME localFt{};
+    SYSTEMTIME st{};
+    if (!FileTimeToLocalFileTime(&ft, &localFt) || !FileTimeToSystemTime(&localFt, &st)) return {};
+    const auto cur = now();
+    if (st.wYear == cur.wYear && st.wMonth == cur.wMonth && st.wDay == cur.wDay)
+        return two(st.wHour) + L":" + two(st.wMinute);
+    return two(st.wDay) + L"." + two(st.wMonth) + L" " + two(st.wHour) + L":" + two(st.wMinute);
+}
+
+Text resolveNotifAppName(const Text& aumid) {
+    if (aumid.empty()) return L"Windows";
+    ComPtr<IShellItem> item;
+    const Text shellPath = L"shell:AppsFolder\\" + aumid;
+    if (SUCCEEDED(SHCreateItemFromParsingName(shellPath.c_str(), nullptr, IID_PPV_ARGS(&item))) && item) {
+        PWSTR name{};
+        if (SUCCEEDED(item->GetDisplayName(SIGDN_NORMALDISPLAY, &name)) && name) {
+            Text out = name;
+            CoTaskMemFree(name);
+            if (!out.empty()) return out;
+        }
+    }
+    Text clean = aumid;
+    const size_t bang = clean.find(L'!');
+    if (bang != Text::npos) clean.resize(bang);
+    const size_t us = clean.find(L'_');
+    if (us != Text::npos) clean.resize(us);
+    const size_t dot = clean.rfind(L'.');
+    if (dot != Text::npos && dot + 1 < clean.size()) clean = clean.substr(dot + 1);
+    const size_t slash = clean.find_last_of(L"\\/");
+    if (slash != Text::npos && slash + 1 < clean.size()) clean = clean.substr(slash + 1);
+    if (clean.ends_with(L".exe") || clean.ends_with(L".EXE")) clean.resize(clean.size() - 4);
+    if (clean.empty()) return L"Windows";
+    if (clean.find(L"WhatsApp") != Text::npos) return L"WhatsApp";
+    return clean;
+}
+
+std::vector<WinNotification> readWindowsNotificationsSync() {
+    std::vector<WinNotification> result;
+    wchar_t localApp[MAX_PATH]{};
+    if (!GetEnvironmentVariableW(L"LOCALAPPDATA", localApp, ARRAYSIZE(localApp))) return result;
+    const Text srcBase = Text(localApp) + L"\\Microsoft\\Windows\\Notifications\\wpndatabase.db";
+    if (GetFileAttributesW(srcBase.c_str()) == INVALID_FILE_ATTRIBUTES) return result;
+
+    wchar_t tmpDir[MAX_PATH]{};
+    if (!GetTempPathW(ARRAYSIZE(tmpDir), tmpDir)) return result;
+    const Text dstBase = Text(tmpDir) + L"Vetra_wpn_" + num(GetCurrentProcessId()) + L".db";
+    if (!CopyFileW(srcBase.c_str(), dstBase.c_str(), FALSE)) return result;
+    CopyFileW((srcBase + L"-wal").c_str(), (dstBase + L"-wal").c_str(), FALSE);
+    CopyFileW((srcBase + L"-shm").c_str(), (dstBase + L"-shm").c_str(), FALSE);
+
+    static HMODULE hSq = LoadLibraryW(L"winsqlite3.dll");
+    if (hSq) {
+        using OpenFn   = int(__stdcall*)(const char*, void**, int, const char*);
+        using CloseFn  = int(__stdcall*)(void*);
+        using PrepFn   = int(__stdcall*)(void*, const char*, int, void**, const char**);
+        using StepFn   = int(__stdcall*)(void*);
+        using Int64Fn  = int64_t(__stdcall*)(void*, int);
+        using TextFn   = const unsigned char*(__stdcall*)(void*, int);
+        using BytesFn  = int(__stdcall*)(void*, int);
+        using FinFn    = int(__stdcall*)(void*);
+        auto sqOpen  = reinterpret_cast<OpenFn>(GetProcAddress(hSq, "sqlite3_open_v2"));
+        auto sqClose = reinterpret_cast<CloseFn>(GetProcAddress(hSq, "sqlite3_close"));
+        auto sqPrep  = reinterpret_cast<PrepFn>(GetProcAddress(hSq, "sqlite3_prepare_v2"));
+        auto sqStep  = reinterpret_cast<StepFn>(GetProcAddress(hSq, "sqlite3_step"));
+        auto sqInt64 = reinterpret_cast<Int64Fn>(GetProcAddress(hSq, "sqlite3_column_int64"));
+        auto sqText  = reinterpret_cast<TextFn>(GetProcAddress(hSq, "sqlite3_column_text"));
+        auto sqBytes = reinterpret_cast<BytesFn>(GetProcAddress(hSq, "sqlite3_column_bytes"));
+        auto sqFin   = reinterpret_cast<FinFn>(GetProcAddress(hSq, "sqlite3_finalize"));
+        if (sqOpen && sqClose && sqPrep && sqStep && sqInt64 && sqText && sqBytes && sqFin) {
+            int utf8Len = WideCharToMultiByte(CP_UTF8, 0, dstBase.c_str(), -1, nullptr, 0, nullptr, nullptr);
+            std::string dstUtf8(utf8Len > 0 ? utf8Len - 1 : 0, '\0');
+            if (utf8Len > 1) WideCharToMultiByte(CP_UTF8, 0, dstBase.c_str(), -1, dstUtf8.data(), utf8Len - 1, nullptr, nullptr);
+            void* db = nullptr;
+            if (sqOpen(dstUtf8.c_str(), &db, 1 /* SQLITE_OPEN_READONLY */, nullptr) == 0 && db) {
+                FILETIME nowFt{};
+                GetSystemTimeAsFileTime(&nowFt);
+                const int64_t nowVal = static_cast<int64_t>((static_cast<uint64_t>(nowFt.dwHighDateTime) << 32) | nowFt.dwLowDateTime);
+                const char* sql =
+                    "SELECT n.Id, h.PrimaryId, n.ArrivalTime, n.ExpiryTime, n.Payload "
+                    "FROM Notification n "
+                    "LEFT JOIN NotificationHandler h ON n.HandlerId = h.RecordId "
+                    "WHERE n.Type = 'toast' "
+                    "ORDER BY n.ArrivalTime DESC LIMIT 40";
+                void* stmt = nullptr;
+                if (sqPrep(db, sql, -1, &stmt, nullptr) == 0 && stmt) {
+                    const HRESULT comHr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+                    while (sqStep(stmt) == 100 /* SQLITE_ROW */) {
+                        const int64_t id = sqInt64(stmt, 0);
+                        const auto* rawAumid = sqText(stmt, 1);
+                        const int64_t arrival = sqInt64(stmt, 2);
+                        const int64_t expiry = sqInt64(stmt, 3);
+                        const auto* rawPayload = sqText(stmt, 4);
+                        const int payloadLen = sqBytes(stmt, 4);
+                        if (expiry > 0 && expiry < nowVal) continue;
+                        if (!rawPayload || payloadLen <= 0) continue;
+                        WinNotification item;
+                        item.id = id;
+                        item.arrivalTime = arrival;
+                        item.aumid = rawAumid ? utf16(reinterpret_cast<const char*>(rawAumid)) : Text{};
+                        item.appName = resolveNotifAppName(item.aumid);
+                        item.timeLabel = formatNotifTime(arrival);
+                        parseToastPayload(std::string(reinterpret_cast<const char*>(rawPayload), static_cast<size_t>(payloadLen)),
+                            item.title, item.body, item.launchUri);
+                        if (item.title.empty() && item.body.empty()) continue;
+                        if (!item.aumid.empty()) {
+                            item.icon = appImage(L"shell:AppsFolder\\" + item.aumid);
+                            if (!item.icon && item.aumid.find(L'\\') != Text::npos)
+                                item.icon = appImage(item.aumid);
+                        }
+                        result.push_back(std::move(item));
+                    }
+                    if (SUCCEEDED(comHr)) CoUninitialize();
+                    sqFin(stmt);
+                }
+                sqClose(db);
+            }
+        }
+    }
+    DeleteFileW(dstBase.c_str());
+    DeleteFileW((dstBase + L"-wal").c_str());
+    DeleteFileW((dstBase + L"-shm").c_str());
+    return result;
+}
+}
+
+void Dock::queryDoNotDisturb() {
+    extra.dndEnabled = readWindowsDndProfile() > 0;
+}
+
+void Dock::toggleDoNotDisturb() {
+    const bool next = !extra.dndEnabled;
+    if (writeWindowsDndProfile(next ? 1 : 0)) {
+        extra.dndEnabled = next;
+    } else {
+        queryDoNotDisturb();
+        report(L"Rahatsız Etmeyin durumu değiştirilemedi.");
+    }
+    paintBar();
+    if (panel && page == NotificationCenter) paintSheet();
+}
+
+void Dock::refreshNotifications(bool force) {
+    queryDoNotDisturb();
+    const ULONGLONG stamp = GetTickCount64();
+    if (!force && extra.lastNotifPollAt && stamp - extra.lastNotifPollAt < 4000) return;
+    if (extra.notifRequest.valid()) return;
+    extra.lastNotifPollAt = stamp;
+    const HWND notify = hwnd;
+    const auto stop = extra.proStop;
+    try {
+        extra.notifRequest = std::async(std::launch::async, [notify, stop] {
+            auto list = readWindowsNotificationsSync();
+            if (notify && (!stop || !stop->load())) PostMessageW(notify, AsyncWake, 0, 0);
+            return list;
+        });
+    } catch (const std::exception&) {}
+}
+
+void Dock::pollNotifications() {
+    if (!extra.notifRequest.valid() ||
+        extra.notifRequest.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
+        return;
+    try {
+        auto fresh = extra.notifRequest.get();
+        std::vector<WinNotification> filtered;
+        filtered.reserve(fresh.size());
+        for (auto& item : fresh) {
+            if (extra.clearedNotifBefore > 0 && item.arrivalTime <= extra.clearedNotifBefore) continue;
+            if (std::find(extra.dismissedNotifIds.begin(), extra.dismissedNotifIds.end(), item.id) != extra.dismissedNotifIds.end())
+                continue;
+            filtered.push_back(std::move(item));
+        }
+        const bool changed = filtered.size() != extra.notifications.size() ||
+            (!filtered.empty() && !extra.notifications.empty() && filtered.front().id != extra.notifications.front().id);
+        extra.notifications = std::move(filtered);
+        if (changed) {
+            if (anyDockVisible()) paintBar();
+            if (panel && !sheetClosing && page == NotificationCenter) paintSheet();
+        }
+    } catch (const std::exception&) {}
+}
+
+void Dock::dismissNotification(int64_t id) {
+    if (std::find(extra.dismissedNotifIds.begin(), extra.dismissedNotifIds.end(), id) == extra.dismissedNotifIds.end())
+        extra.dismissedNotifIds.push_back(id);
+    std::erase_if(extra.notifications, [id](const WinNotification& n) { return n.id == id; });
+    paintBar();
+    if (panel && page == NotificationCenter) paintSheet();
+}
+
+void Dock::clearAllNotifications() {
+    int64_t maxArrival = extra.clearedNotifBefore;
+    for (const auto& n : extra.notifications) {
+        if (n.arrivalTime > maxArrival) maxArrival = n.arrivalTime;
+        if (std::find(extra.dismissedNotifIds.begin(), extra.dismissedNotifIds.end(), n.id) == extra.dismissedNotifIds.end())
+            extra.dismissedNotifIds.push_back(n.id);
+    }
+    if (maxArrival == 0) {
+        FILETIME ft{};
+        GetSystemTimeAsFileTime(&ft);
+        maxArrival = static_cast<int64_t>((static_cast<uint64_t>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime);
+    }
+    extra.clearedNotifBefore = maxArrival;
+    extra.notifications.clear();
+    listOffset = 0;
+    paintBar();
+    if (panel && page == NotificationCenter) paintSheet();
+}
+
+void Dock::activateNotification(const WinNotification& item) {
+    close();
+    if (!item.launchUri.empty()) {
+        launch(item.launchUri);
+        return;
+    }
+    if (!item.aumid.empty()) {
+        if (item.aumid.find(L'\\') != Text::npos && GetFileAttributesW(item.aumid.c_str()) != INVALID_FILE_ATTRIBUTES)
+            launch(item.aumid);
+        else
+            launch(L"shell:AppsFolder\\" + item.aumid);
+    }
+}
 void Dock::changeVolume(int by, bool mute) {
     audio(extra, by, mute);
     if (extra.volume < 0) report(L"Etkin ses çıkışı bulunamadı.");
@@ -1271,6 +1587,7 @@ void Dock::sampleExtras(bool immediate) {
     if (enabled(MicControl) || sbMic) sampleMicrophone();
     if (sbKey || page == KeyboardLang) sampleKeyboardLayout();
     if (sbNet) sampleNetworkFast();
+    if ((sb.enabled && sb.notifications) || page == NotificationCenter) refreshNotifications(immediate && page == NotificationCenter);
     if (page == Quick || enabled(QuickToggles) ||
         (sbNet && (immediate || !extra.lastRadioPollAt || stamp - extra.lastRadioPollAt >= 10000))) {
         extra.lastRadioPollAt = stamp;
@@ -2240,6 +2557,7 @@ bool Dock::tickExtras(ULONGLONG stamp, const SYSTEMTIME& local) {
     pollAppImages();
     pollInstalledAppImages();
     pollJumpList();
+    pollNotifications();
     if (extra.windowIconsRequest.valid() &&
         extra.windowIconsRequest.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
         try {
@@ -2280,10 +2598,10 @@ bool Dock::tickExtras(ULONGLONG stamp, const SYSTEMTIME& local) {
         const int prevBt = extra.radios.bluetooth;
         try { extra.radios = extra.radioRequest.get(); }
         catch (const std::exception&) { extra.radios.denied = true; }
-        if (shown(QuickToggles) || (model.statusBar.enabled && model.statusBar.network)) dirty = true;
-        if (page == Quick) {
-            refreshWifi(false, extra.quickSub == QuickSubPanel::Wifi);
-            if (extra.quickSub == QuickSubPanel::Bluetooth && (extra.radios.bluetooth != prevBt || extra.btDevices.empty()))
+        if (shown(QuickToggles) || (model.statusBar.enabled && model.statusBar.network) || page == NetworkPanel) dirty = true;
+        if (page == Quick || page == NetworkPanel) {
+            refreshWifi(false, page == NetworkPanel || extra.quickSub == QuickSubPanel::Wifi);
+            if (page == Quick && extra.quickSub == QuickSubPanel::Bluetooth && (extra.radios.bluetooth != prevBt || extra.btDevices.empty()))
                 queryBluetoothDevices();
             if (extra.radios.denied) report(L"Windows kablosuz denetime izin vermedi.");
             dirty = true;
@@ -2342,9 +2660,9 @@ bool Dock::tickExtras(ULONGLONG stamp, const SYSTEMTIME& local) {
         if (page == Quick && extra.quickSub == QuickSubPanel::Bluetooth) queryBluetoothDevices();
         dirty = true;
     }
-    if (page == Quick && extra.wifiUpdateAt && stamp >= extra.wifiUpdateAt) {
+    if ((page == Quick || page == NetworkPanel) && extra.wifiUpdateAt && stamp >= extra.wifiUpdateAt) {
         extra.wifiUpdateAt = stamp < extra.wifiUpdateUntil ? stamp + 2000 : 0;
-        refreshWifi(false, extra.quickSub == QuickSubPanel::Wifi);
+        refreshWifi(false, page == NetworkPanel || extra.quickSub == QuickSubPanel::Wifi);
         queryRadios();
         dirty = true;
     }

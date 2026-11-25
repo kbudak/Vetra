@@ -111,8 +111,8 @@ float Dock::statusBarWidth() const {
     addGroup(inputW);
 
     float quickW = 0.f;
-    if (showNet) quickW += 28.f;
-    if (showVol) quickW += (quickW > 0.f ? 2.f : 0.f) + 28.f;
+    if (showNet) quickW += 32.f;
+    if (showVol) quickW += (quickW > 0.f ? 2.f : 0.f) + 32.f;
     if (showBat) quickW += (quickW > 0.f ? 2.f : 0.f) + 32.f;
     addGroup(quickW);
 
@@ -231,59 +231,54 @@ void Dock::drawStatusBar(View& view, float x, Palette p) {
         prevGroup = true;
     }
 
-    // Group 2: Internet Connection + Volume + Battery
+    // Group 2: Internet Connection + Volume + Battery (each opens its own dedicated panel)
     if (showNet || showVol || showBat) {
         if (prevGroup) drawDivider();
-        const bool quickOpen = isPrimary && panel && !sheetClosing && page == Quick;
         if (showNet) {
-            const Box slot = box(cx, itemTop, 28.f, itemH);
+            const Box slot = box(cx, itemTop, 32.f, itemH);
+            const bool netOpen = isPrimary && panel && !sheetClosing && page == NetworkPanel;
             const bool eth = extra.radios.ethernet || extra.netEthernetFast;
             const bool wifi = extra.wifiConnected || !extra.radios.network.empty() || extra.netWifiFast;
             const bool airplane = extra.radios.airplane;
-            hit(view, slot, [this, mid = (slot.left + slot.right) / 2.f] { open(Quick, mid); },
-                [this, eth, wifi, mid = (slot.left + slot.right) / 2.f] {
-                    if (eth && !wifi) launch(L"ms-settings:network-status");
-                    else {
-                        if (!panel || page != Quick || sheetClosing) open(Quick, mid);
-                        if (panel && page == Quick && !sheetClosing) openQuickSub(QuickSubPanel::Wifi);
-                    }
-                });
+            hit(view, slot, [this, mid = (slot.left + slot.right) / 2.f] { open(NetworkPanel, mid); },
+                [this] { launch(L"ms-settings:network-status"); });
             const float hot = view.hoverAmount();
             const float down = view.pressAmount();
-            drawPillBg(slot, hot, quickOpen);
+            drawPillBg(slot, hot, netOpen);
             const Glyph netGlyph = airplane ? Plane : eth ? EthernetIcon : wifi ? Wifi : GlobeOff;
             const unsigned netCol = (!eth && !wifi && !airplane) ? p.muted : p.ink;
             D2D1::Matrix3x2F prev{};
             if (down > 0.005f) {
                 d.target->GetTransform(&prev);
                 const float s = 1.f - 0.07f * down;
-                d.target->SetTransform(D2D1::Matrix3x2F::Scale(s, s, {slot.left + 14.f, slot.top + itemH / 2.f}) * prev);
+                d.target->SetTransform(D2D1::Matrix3x2F::Scale(s, s, {slot.left + 16.f, slot.top + itemH / 2.f}) * prev);
             }
-            d.icon(netGlyph, box(slot.left + 5.f, slot.top + (itemH - 18.f) / 2.f, 18.f, 18.f), tint(netCol, .92f));
+            d.icon(netGlyph, d.snap(box(slot.left + 6.f, slot.top + (itemH - 20.f) / 2.f, 20.f, 20.f)), tint(netCol, .96f));
             if (down > 0.005f) d.target->SetTransform(prev);
-            cx += 28.f;
+            cx += 32.f;
             if (showVol || showBat) cx += 2.f;
         }
         if (showVol) {
-            const Box slot = box(cx, itemTop, 28.f, itemH);
+            const Box slot = box(cx, itemTop, 32.f, itemH);
+            const bool volOpen = isPrimary && panel && !sheetClosing && page == Volume;
             if (isPrimary) statusVolumeHit = slot;
-            hit(view, slot, [this, mid = (slot.left + slot.right) / 2.f] { open(Quick, mid); },
+            hit(view, slot, [this, mid = (slot.left + slot.right) / 2.f] { open(Volume, mid); },
                 [this] { changeVolume(0, true); });
             const float hot = view.hoverAmount();
             const float down = view.pressAmount();
-            drawPillBg(slot, hot, quickOpen);
+            drawPillBg(slot, hot, volOpen);
             const bool isMuted = extra.muted || extra.volume == 0;
             const Glyph volGlyph = isMuted ? SpeakerMuted : (extra.volume >= 0 && extra.volume < 45) ? SpeakerLow : Speaker;
             D2D1::Matrix3x2F prev{};
             if (down > 0.005f) {
                 d.target->GetTransform(&prev);
                 const float s = 1.f - 0.07f * down;
-                d.target->SetTransform(D2D1::Matrix3x2F::Scale(s, s, {slot.left + 14.f, slot.top + itemH / 2.f}) * prev);
+                d.target->SetTransform(D2D1::Matrix3x2F::Scale(s, s, {slot.left + 16.f, slot.top + itemH / 2.f}) * prev);
             }
-            d.icon(volGlyph, box(slot.left + 5.f, slot.top + (itemH - 18.f) / 2.f, 18.f, 18.f),
-                tint(isMuted ? p.muted : p.ink, isMuted ? .78f : .92f));
+            d.icon(volGlyph, d.snap(box(slot.left + 6.f, slot.top + (itemH - 20.f) / 2.f, 20.f, 20.f)),
+                tint(isMuted ? p.muted : p.ink, isMuted ? .80f : .96f));
             if (down > 0.005f) d.target->SetTransform(prev);
-            cx += 28.f;
+            cx += 32.f;
             if (showBat) cx += 2.f;
         }
         if (showBat) {
@@ -328,13 +323,13 @@ void Dock::drawStatusBar(View& view, float x, Palette p) {
     // Group 3: Clock & Date + Notifications Bell
     if (showClock || showBell) {
         if (prevGroup) drawDivider();
+        const bool notifOpen = isPrimary && panel && !sheetClosing && (page == NotificationCenter || page == Calendar || page == Clock);
         if (showClock) {
             const Box slot = box(cx, itemTop, 68.f, itemH);
-            const bool calOpen = isPrimary && panel && !sheetClosing && (page == Calendar || page == Clock);
-            hit(view, slot, [this, mid = (slot.left + slot.right) / 2.f] { open(Calendar, mid); },
+            hit(view, slot, [this, mid = (slot.left + slot.right) / 2.f] { open(NotificationCenter, mid); },
                 [this] { launch(L"ms-settings:dateandtime"); });
             const float hot = view.hoverAmount();
-            drawPillBg(slot, hot, calOpen);
+            drawPillBg(slot, hot, notifOpen);
             const auto t = now();
             const Text timeStr = two(t.wHour) + L":" + two(t.wMinute);
             const Text dateStr = two(t.wDay) + L"." + two(t.wMonth) + L"." + num(t.wYear);
@@ -345,22 +340,349 @@ void Dock::drawStatusBar(View& view, float x, Palette p) {
         }
         if (showBell) {
             const Box slot = box(cx, itemTop, 26.f, itemH);
-            hit(view, slot, [this] { systemShortcut('N'); },
+            hit(view, slot, [this, mid = (slot.left + slot.right) / 2.f] { open(NotificationCenter, mid); },
                 [this] { launch(L"ms-settings:notifications"); });
             const float hot = view.hoverAmount();
             const float down = view.pressAmount();
-            drawPillBg(slot, hot, false);
+            drawPillBg(slot, hot, notifOpen);
             D2D1::Matrix3x2F prev{};
             if (down > 0.005f) {
                 d.target->GetTransform(&prev);
                 const float s = 1.f - 0.07f * down;
                 d.target->SetTransform(D2D1::Matrix3x2F::Scale(s, s, {slot.left + 13.f, slot.top + itemH / 2.f}) * prev);
             }
-            d.icon(BellIcon, box(slot.left + 4.5f, slot.top + (itemH - 17.f) / 2.f, 17.f, 17.f), tint(p.ink, .88f));
+            const unsigned bellCol = extra.dndEnabled ? (p.light ? 0x078D82 : 0x45E5D8) : p.ink;
+            d.icon(BellIcon, box(slot.left + 4.5f, slot.top + (itemH - 17.f) / 2.f, 17.f, 17.f), tint(bellCol, .90f));
+            if (extra.dndEnabled) {
+                d.circle(slot.right - 5.f, slot.top + 7.5f, 2.3f, tint(bellCol));
+            } else if (!extra.notifications.empty()) {
+                d.circle(slot.right - 5.f, slot.top + 7.5f, 2.4f, tint(p.light ? 0x0A7AFF : 0x4DA3FF));
+            }
             if (down > 0.005f) d.target->SetTransform(prev);
             cx += 26.f;
         }
     }
+}
+
+void Dock::notificationPanel(Palette p) {
+    auto& d = sheet.d;
+    const auto t = now();
+    const Date today = Date::from(t);
+    const unsigned teal = model.accent > 0 ? p.accent : (p.light ? 0x078D82 : 0x3BD6C6);
+    const unsigned tealInk = model.accent > 0 ? p.activeInk : 0x0B1514;
+    const auto rowHoverColor = [&](float hot) {
+        return tint(p.glass ? (p.light ? 0x10141A : 0xFFFFFF) : p.accent, (p.glass ? .075f : .12f) * hot);
+    };
+
+    // --- Section 1: Bildirimler ---
+    d.text(L"Bildirimler", box(22, 16, 180, 28), Strong, tint(p.ink));
+
+    // Do Not Disturb (Rahatsız Etmeyin) toggle button
+    {
+        const Box dndBtn = box(224, 16, 32, 28);
+        hit(sheet, dndBtn, [this] { toggleDoNotDisturb(); });
+        const float hot = sheet.hoverAmount();
+        const float down = sheet.pressAmount();
+        D2D1::Matrix3x2F prev{};
+        if (down > 0.005f) {
+            d.target->GetTransform(&prev);
+            const float s = 1.f - 0.06f * down;
+            d.target->SetTransform(D2D1::Matrix3x2F::Scale(s, s, {dndBtn.left + 16.f, dndBtn.top + 14.f}) * prev);
+        }
+        if (extra.dndEnabled) {
+            d.fill(dndBtn, 8.f, tint(teal, .92f - .10f * hot));
+            d.icon(BellIcon, box(dndBtn.left + 8.f, dndBtn.top + 6.f, 16.f, 16.f), tint(tealInk));
+            d.line(dndBtn.left + 8.f, dndBtn.bottom - 7.f, dndBtn.right - 8.f, dndBtn.top + 7.f, tint(tealInk), 1.45f);
+        } else {
+            d.fill(dndBtn, 8.f, tint(p.ink, .08f + .08f * hot));
+            d.outline(box(dndBtn.left + .5f, dndBtn.top + .5f, width(dndBtn) - 1.f, height(dndBtn) - 1.f), 7.5f, tint(p.line, .24f));
+            d.icon(BellIcon, box(dndBtn.left + 8.f, dndBtn.top + 6.f, 16.f, 16.f), tint(p.ink, .86f));
+        }
+        if (down > 0.005f) d.target->SetTransform(prev);
+    }
+
+    // "Tümünü temizle" button
+    button(sheet, p, box(262, 16, 102, 28), L"Tümünü temizle", [this] { clearAllNotifications(); }, false, Small);
+
+    float listTop = 54.f;
+    if (extra.dndEnabled) {
+        const Box banner = box(20, 54, 344, 70);
+        p.card(d, banner, 12);
+        d.icon(Moon, box(32, 63, 14, 14), tint(teal));
+        d.text(L"Rahatsız Etmeyin Modu Açık", box(51, 60, 298, 19), Strong, tint(p.ink));
+        d.text(L"Yalnızca öncelikli bildirimler ve alarmlar görünür.", box(32, 81, 318, 16), Small, tint(p.muted));
+        const Box settingsLink = box(30, 100, 118, 20);
+        hit(sheet, settingsLink, [this] { launch(L"ms-settings:notifications"); });
+        const float linkHot = sheet.hoverAmount();
+        d.text(L"Bildirim ayarları", box(32, 100, 116, 18), Small, tint(mixRgb(teal, p.ink, .15f * linkHot)));
+        d.line(32, 116.5f, 111, 116.5f, tint(teal, .55f + .35f * linkHot), .9f);
+        listTop = 132.f;
+    }
+
+    const float listBottom = 326.f;
+    const int totalNotifs = static_cast<int>(extra.notifications.size());
+    const float cardH = 74.f, cardGap = 6.f;
+    const int maxRows = std::max(1, static_cast<int>((listBottom - listTop + cardGap) / (cardH + cardGap)));
+    listOffset = std::clamp(listOffset, 0, std::max(0, totalNotifs - maxRows));
+
+    if (totalNotifs == 0) {
+        const float midY = (listTop + listBottom) / 2.f;
+        d.icon(BellIcon, box(180, midY - 26.f, 24, 24), tint(p.muted, .50f));
+        d.text(L"Yeni bildirim yok", box(20, midY + 4.f, 344, 22), Body, tint(p.muted), Center);
+        if (!extra.dndEnabled) {
+            const Box settingsLink = box(132, midY + 30.f, 120, 20);
+            hit(sheet, settingsLink, [this] { launch(L"ms-settings:notifications"); });
+            d.text(L"Bildirim ayarları", settingsLink, Small, tint(teal), Center);
+        }
+    } else {
+        for (int i = 0; i < maxRows && i + listOffset < totalNotifs; ++i) {
+            const auto& item = extra.notifications[i + listOffset];
+            const float cy = listTop + i * (cardH + cardGap);
+            const Box card = box(20, cy, 344, cardH);
+            p.card(d, card, 12);
+            hit(sheet, box(card.left, card.top, width(card) - 30.f, height(card)), [this, item] { activateNotification(item); });
+            const float hot = sheet.hoverAmount();
+            if (hot > 0.f) d.fill(card, 12, rowHoverColor(hot));
+
+            // Dismiss button (top-right inside card)
+            const Box dismissBox = box(card.right - 26.f, cy + 6.f, 20.f, 20.f);
+            hit(sheet, dismissBox, [this, id = item.id] { dismissNotification(id); });
+            const float disHot = sheet.hoverAmount();
+            if (disHot > 0.f) d.fill(dismissBox, 6.f, tint(p.ink, .14f * disHot));
+            d.icon(Close, box(dismissBox.left + 5.f, dismissBox.top + 5.f, 10.f, 10.f), tint(p.muted, .55f + .45f * disHot));
+
+            // App icon + name + timestamp
+            if (item.icon) d.image(item.icon, box(31, cy + 9, 16, 16), p.light);
+            else d.icon(BellIcon, box(32, cy + 10, 14, 14), tint(teal));
+            d.text(item.appName, box(53, cy + 7, 210, 19), Caption, tint(p.ink));
+            if (!item.timeLabel.empty())
+                d.text(item.timeLabel, box(264, cy + 8, 68, 17), Small, tint(p.muted), Right);
+
+            // Title & body
+            if (!item.body.empty()) {
+                d.text(item.title, box(31, cy + 29, 322, 19), Strong, tint(p.ink));
+                d.text(item.body, box(31, cy + 49, 322, 17), Small, tint(p.muted));
+            } else {
+                d.text(item.title, box(31, cy + 35, 322, 24), Body, tint(p.ink));
+            }
+        }
+        if (totalNotifs > maxRows) {
+            const float trackH = listBottom - listTop - 6.f;
+            const float thumbH = std::max(24.f, trackH * static_cast<float>(maxRows) / totalNotifs);
+            const float frac = static_cast<float>(listOffset) / std::max(1, totalNotifs - maxRows);
+            d.fill(box(369, listTop + 2.f, 2.5f, trackH), 1.25f, tint(p.ink, .08f));
+            d.fill(box(369, listTop + 2.f + (trackH - thumbH) * frac, 2.5f, thumbH), 1.25f, tint(teal, .65f));
+        }
+    }
+
+    // --- Section 2: Mini Calendar + Focus Session ---
+    const float calTop = 338.f;
+    const float calH = extra.notifCalExpanded ? 308.f : 44.f;
+    const Box calCard = box(20, calTop, 344, calH);
+    p.card(d, calCard, 14);
+
+    // Date header ("25 Kasım Çarşamba") + collapse/expand chevron
+    const Text headerDate = num(today.day) + L" " + Months[today.month - 1] + L" " + LongDays[t.wDayOfWeek];
+    hit(sheet, box(26, calTop + 4, 290, 34), [this] {
+        selected = month = Date::from(now());
+        paintSheet();
+    }, [this] { open(Calendar, panelDockX); });
+    d.text(headerDate, box(34, calTop + 10, 276, 24), Strong, tint(p.ink));
+
+    iconButton(sheet, p, box(330, calTop + 9, 26, 26), extra.notifCalExpanded ? ChevronDown : ChevronUp, [this] {
+        extra.notifCalExpanded = !extra.notifCalExpanded;
+        positionSheet();
+    });
+
+    if (!extra.notifCalExpanded) return;
+
+    d.line(30, calTop + 44.f, 354, calTop + 44.f, tint(p.ink, .08f));
+
+    // Month title + Up/Down arrows
+    d.text(Text(Months[month.month - 1]) + L" " + num(month.year), box(34, calTop + 52.f, 240, 24), Strong, tint(p.ink));
+    auto shiftMonth = [this](int dir) {
+        Date first{month.year, month.month, 1};
+        if ((first.year == 1601 && first.month == 1 && dir < 0) || (first.year == 9999 && first.month == 12 && dir > 0)) return;
+        month = first.add(dir < 0 ? -1 : first.length());
+        month.day = 1;
+        paintSheet();
+    };
+    iconButton(sheet, p, box(296, calTop + 51.f, 26, 24), ChevronUp, [shiftMonth] { shiftMonth(-1); });
+    iconButton(sheet, p, box(328, calTop + 51.f, 26, 24), ChevronDown, [shiftMonth] { shiftMonth(1); });
+
+    // Weekday headers (Pt Sa Ça Pe Cu Ct Pa)
+    constexpr const wchar_t* TwoDays[] = {L"Pt", L"Sa", L"Ça", L"Pe", L"Cu", L"Ct", L"Pa"};
+    constexpr float gridX = 30.f, cellW = 46.2f, rowH = 26.5f;
+    for (int col = 0; col < 7; ++col) {
+        d.text(TwoDays[col], box(gridX + col * cellW, calTop + 82.f, cellW, 18.f), Small, tint(p.muted), Center);
+    }
+
+    // 6x7 day grid (including previous & next month overflow days)
+    const Date firstOfMonth{month.year, month.month, 1};
+    const int lead = (firstOfMonth.weekday() + 6) % 7;
+    const Date gridStart = firstOfMonth.add(-lead);
+    const float gridY = calTop + 102.f;
+    for (int idx = 0; idx < 42; ++idx) {
+        const Date cellDate = gridStart.add(idx);
+        const int col = idx % 7, row = idx / 7;
+        const float cx = gridX + col * cellW;
+        const float cy = gridY + row * rowH;
+        const float midX = cx + cellW / 2.f, midY = cy + 12.f;
+        const bool inMonth = (cellDate.month == month.month && cellDate.year == month.year);
+        const bool isToday = cellDate.key() == today.key();
+        const bool isSel = cellDate.key() == selected.key();
+
+        hit(sheet, box(cx + 4.f, cy, cellW - 8.f, 25.f), [this, cellDate] {
+            selected = cellDate;
+            month = {cellDate.year, cellDate.month, 1};
+            paintSheet();
+        }, [this, cellDate] {
+            selected = cellDate;
+            month = {cellDate.year, cellDate.month, 1};
+            open(Calendar, panelDockX);
+        });
+        const float hot = sheet.hoverAmount();
+        if (isToday) {
+            d.circle(midX, midY, 12.f, tint(teal));
+        } else if (isSel) {
+            d.circle(midX, midY, 12.f, tint(teal, .16f));
+            d.circle(midX, midY, 11.5f, tint(teal, .85f), false, 1.2f);
+        } else if (hot > 0.f) {
+            d.circle(midX, midY, 12.f, tint(p.ink, .11f * hot));
+        }
+        const Color dayCol = isToday ? tint(tealInk)
+            : inMonth ? tint(p.ink, .94f)
+            : tint(p.muted, .42f);
+        d.text(num(cellDate.day), box(cx, cy + 1.5f, cellW, 21.f), isToday ? Strong : Caption, dayCol, Center);
+
+        // Subtle dot if Vetra calendar has an event on this date
+        for (const auto& ev : model.events) {
+            if (ev.day == cellDate.key()) {
+                d.circle(midX, cy + 23.2f, 1.5f, tint(isToday ? tealInk : EventColors[std::clamp(ev.kind, 0, 2)]));
+                break;
+            }
+        }
+    }
+
+    // Focus session footer ("-  30 dk  +   [▶ Odaklanma]")
+    const float footY = calTop + 266.f;
+    d.line(30, footY - 4.f, 354, footY - 4.f, tint(p.ink, .08f));
+    iconButton(sheet, p, box(32, footY + 3.f, 26, 26), Minus, [this] {
+        setTimerMinutes(Focus, std::max(5, model.focusMinutes - 5));
+    });
+    const Text focusLabel = focusTimer.active() ? durationText(focusTimer.seconds) : (num(model.focusMinutes) + L" dk");
+    d.text(focusLabel, box(62, footY + 3.f, 64, 26), Strong, tint(focusTimer.running() ? teal : p.ink), Center);
+    iconButton(sheet, p, box(130, footY + 3.f, 26, 26), Plus, [this] {
+        setTimerMinutes(Focus, std::min(FocusMaxMinutes, model.focusMinutes + 5));
+    });
+    const Text focusBtnLabel = focusTimer.running() ? L"Duraklat" : L"▶  Odaklanma";
+    button(sheet, p, box(228, footY + 2.f, 126, 28), focusBtnLabel, [this] { toggleTimer(Focus); }, focusTimer.running(), Caption);
+}
+
+void Dock::networkPanel(Palette p) {
+    auto& d = sheet.d;
+    const bool eth = extra.radios.ethernet || extra.netEthernetFast;
+    const bool wifiLinked = extra.wifiConnected || !extra.radios.network.empty();
+    const Text sub = extra.radios.airplane ? L"Uçak modu açık"
+        : eth ? (wifiLinked ? L"Ethernet · " + extra.radios.network : L"Ethernet bağlı")
+        : wifiLinked ? extra.radios.network
+        : extra.netWifiFast ? L"Wi-Fi bağlı"
+        : L"Bağlı değil";
+    heading(p, L"İnternet", sub);
+
+    const auto rowHoverColor = [&](float hot) {
+        return tint(p.glass ? (p.light ? 0x10141A : 0xFFFFFF) : p.accent, (p.glass ? .075f : .12f) * hot);
+    };
+
+    float y = 86.f;
+    if (eth) {
+        const Box ethCard = box(24, y, sheet.w - 48, 46);
+        p.card(d, ethCard, 12);
+        d.icon(EthernetIcon, box(38, y + 13, 20, 20), tint(Design::Green));
+        d.text(L"Ethernet", box(68, y + 5, 220, 19), Strong, tint(p.ink));
+        d.text(L"Kablolu bağlantı etkin", box(68, y + 24, 220, 16), Small, tint(Design::Green));
+        d.circle(ethCard.right - 18.f, y + 23.f, 4.f, tint(Design::Green));
+        y += 52.f;
+    }
+
+    // Wi-Fi toggle card
+    const Box wifiHeader = box(24, y, sheet.w - 48, 42);
+    p.card(d, wifiHeader, 12);
+    d.icon(Wifi, box(38, y + 11, 20, 20), tint(wifiLinked || extra.radios.wifi == 1 ? p.accent : p.muted));
+    d.text(L"Wi-Fi", box(68, y + 5, 190, 32), Strong, tint(p.ink));
+    if (extra.radios.wifi >= 0)
+        knob(p, box(wifiHeader.right - 56.f, y + 10.f, 44.f, 22.f), extra.radios.wifi == 1, [this] { queryRadios(1); });
+    y += 48.f;
+
+    const bool locBlocked = extra.wifiError == ERROR_ACCESS_DENIED;
+    const float listBottom = sheet.h - 58.f;
+    if (locBlocked && extra.wifi.empty() && !extra.wifiScanning) {
+        const Box warnCard = box(24, y, sheet.w - 48, 76);
+        p.card(d, warnCard, 12);
+        d.text(L"Yakındaki ağlar taranamıyor", box(38, y + 7, width(warnCard) - 28, 19), Strong, tint(p.ink));
+        d.text(L"Canlı Wi-Fi taraması için Windows konum izni gerekli.", box(38, y + 26, width(warnCard) - 28, 15), Small, tint(p.muted));
+        button(sheet, p, box(38, y + 46, 154, 24), L"Konum iznini aç", [this] { launch(L"ms-settings:privacy-location"); }, true, Small);
+        button(sheet, p, box(200, y + 46, 156, 24), L"Windows ağ paneli", [this] { launch(L"ms-availablenetworks:"); }, false, Small);
+        y += 82.f;
+        if (!extra.savedWifi.empty() && y + 44.f <= listBottom) {
+            d.text(L"Kayıtlı profiller", box(26, y, 240, 18), Small, tint(p.muted));
+            y += 20.f;
+            const int maxSaved = std::max(1, static_cast<int>((listBottom - y) / 42.f));
+            listOffset = std::clamp(listOffset, 0, std::max(0, static_cast<int>(extra.savedWifi.size()) - maxSaved));
+            for (int i = 0; i < maxSaved && i + listOffset < static_cast<int>(extra.savedWifi.size()); ++i) {
+                const size_t idx = i + listOffset;
+                const auto& net = extra.savedWifi[idx];
+                const Box item = box(24, y + i * 42.f, sheet.w - 48, 38);
+                p.card(d, item, 11);
+                hit(sheet, item, [this, idx] { connectWifi(idx, true); });
+                const float hot = sheet.hoverAmount();
+                if (hot > 0.f) d.fill(item, 11, rowHoverColor(hot));
+                d.icon(Wifi, box(36, item.top + 10, 18, 18), tint(net.connected ? p.accent : p.muted));
+                d.text(net.name, box(62, item.top + 1, 210, 20), Strong, tint(p.ink));
+                d.text(net.connected ? L"Bağlı" : L"Kayıtlı profil", box(62, item.top + 20, 210, 14), Small, tint(p.muted));
+                d.text(net.connected ? L"Kes" : L"Bağlan", box(item.right - 82.f, item.top, 70.f, 38.f), Caption, tint(p.accent), Right);
+            }
+        }
+    } else {
+        d.text(extra.wifiScanning ? L"Yakındaki ağlar taranıyor…" : L"Kullanılabilir Wi-Fi ağları",
+            box(26, y, 300, 20), Caption, tint(p.muted));
+        y += 24.f;
+        const int rows = std::max(1, static_cast<int>((listBottom - y) / 42.f));
+        listOffset = std::clamp(listOffset, 0, std::max(0, static_cast<int>(extra.wifi.size()) - rows));
+        for (int i = 0; i < rows && i + listOffset < static_cast<int>(extra.wifi.size()); ++i) {
+            const size_t idx = i + listOffset;
+            const auto& net = extra.wifi[idx];
+            const Box item = box(24, y + i * 42.f, sheet.w - 48, 38);
+            p.card(d, item, 11);
+            hit(sheet, item, [this, idx] { connectWifi(idx, false); });
+            const float hot = sheet.hoverAmount();
+            if (hot > 0.f) d.fill(item, 11, rowHoverColor(hot));
+            d.icon(Wifi, box(36, item.top + 10, 18, 18), tint(net.connected ? p.accent : p.muted));
+            d.text(net.name, box(62, item.top + 1, 210, 20), Strong, tint(p.ink));
+            const Text st = net.connected
+                ? (net.signal >= 0 ? L"Bağlı · %" + num(net.signal) : L"Bağlı")
+                : (net.secure ? L"Parola korumalı" : L"Açık ağ");
+            d.text(st, box(62, item.top + 20, 210, 14), Small, tint(p.muted));
+            if (net.connected) d.text(L"Kes", box(item.right - 78.f, item.top, 66.f, 38.f), Caption, tint(p.accent), Right);
+            else if (net.signal >= 0) d.text(num(net.signal) + L"%", box(item.right - 78.f, item.top, 66.f, 38.f), Caption, tint(p.muted), Right);
+        }
+        if (extra.wifi.empty()) {
+            d.text(extra.radios.wifi == 0 ? L"Wi-Fi kapalı"
+                : extra.wifiScanning ? L"Ağlar aranıyor…"
+                : L"Kullanılabilir Wi-Fi ağı bulunamadı",
+                box(24, y + 18.f, sheet.w - 48, 60), Body, tint(p.muted), Center);
+        }
+    }
+
+    const float fy = sheet.h - 48.f;
+    const float halfW = (sheet.w - 58.f) / 2.f;
+    button(sheet, p, box(24, fy, halfW, 34), extra.wifiScanning ? L"Taranıyor…" : L"Yenile", [this] {
+        sampleNetworkFast();
+        refreshWifi(true, true);
+        queryRadios();
+        paintSheet();
+    });
+    button(sheet, p, box(24 + halfW + 10.f, fy, halfW, 34), L"Ağ ayarları", [this] { launch(L"ms-settings:network-status"); });
 }
 
 void Dock::keyboardPanel(Palette p) {
@@ -556,29 +878,86 @@ void Dock::extraPanel(Palette p) {
             spark(d, box(224, y + 31, 162, 45), data, accent);
         }
         action(29, 338, 380, L"Ağ ayarlarını aç", [this] { launch(L"ms-settings:network-status"); });
-    } else if (page == Power || page == Volume) {
-        const bool power = page == Power;
-        const int percent = power ? battery : extra.volume;
-        const float smoothPct = power
-            ? (batteryAnim.initialized ? std::clamp(batteryAnim.value, 0.f, 100.f) : static_cast<float>(std::max(0, percent)))
-            : (barVolumeLevel >= 0.f ? std::clamp(barVolumeLevel * 100.f, 0.f, 100.f) : static_cast<float>(std::max(0, percent)));
-        const unsigned ringColor = power ? (p.light ? 0x169C63 : 0x4BD898) : (p.light ? 0x0A7AFF : 0x3B9EFF);
-        heading(p, power ? L"Pil ve güç" : L"Ses", power ? (extra.plugged ? L"Prize bağlı" : L"Windows güç durumu") : L"Varsayılan ses çıkışı");
+    } else if (page == Power) {
+        const int percent = battery;
+        const float smoothPct = batteryAnim.initialized ? std::clamp(batteryAnim.value, 0.f, 100.f) : static_cast<float>(std::max(0, percent));
+        const unsigned ringColor = p.light ? 0x169C63 : 0x4BD898;
+        heading(p, L"Pil ve güç", extra.plugged ? L"Prize bağlı" : L"Windows güç durumu");
         p.card(d, box(29, 105, 380, 139));
         d.arc(box(61, 132, 77, 77), -90, 360, tint(p.ink, .12f), 5);
         if (smoothPct > 0.3f) d.arc(box(61, 132, 77, 77), -90, smoothPct * 3.6f, tint(ringColor), 5);
-        d.icon(power ? Battery : Speaker, box(86, 158, 27, 27), tint(ringColor));
+        d.icon(Battery, box(86, 158, 27, 27), tint(ringColor));
         d.text(percentage(percent), box(164, 122, 224, 60), Number, tint(p.ink));
-        Text detail = power ? (percent < 0 ? L"Pil algılanmadı" : extra.batteryMinutes >= 0 && !extra.plugged ?
-            usageText(extra.batteryMinutes * 60) + L" tahmini" : extra.plugged ? L"Harici güç" : L"Pil kullanılıyor") :
-            (percent < 0 ? L"Ses çıkışı algılanmadı" : extra.muted ? L"Sessiz" : L"Ana ses düzeyi");
+        Text detail = percent < 0 ? L"Pil algılanmadı" : extra.batteryMinutes >= 0 && !extra.plugged ?
+            usageText(extra.batteryMinutes * 60) + L" tahmini" : extra.plugged ? L"Harici güç" : L"Pil kullanılıyor";
         d.text(detail, box(166, 187, 222, 26), Body, tint(p.muted));
-        if (power) action(29, 267, 380, L"Güç ayarlarını aç", [this] { launch(L"ms-settings:powersleep"); }, true);
-        else {
-            action(29, 267, 105, L"− 10", [this] { changeVolume(-10); });
-            action(144, 267, 150, extra.muted ? L"Sesi aç" : L"Sessize al", [this] { changeVolume(0, true); }, true);
-            action(304, 267, 105, L"+ 10", [this] { changeVolume(10); });
+        action(29, 267, 380, L"Güç ayarlarını aç", [this] { launch(L"ms-settings:powersleep"); }, true);
+    } else if (page == Volume) {
+        const Text sub = extra.outputName.empty() ? L"Varsayılan ses çıkışı" : extra.outputName;
+        heading(p, L"Ses", sub);
+
+        // Dedicated interactive volume slider card
+        const Box volCard = box(24, 88, sheet.w - 48, 64);
+        p.card(d, volCard, 14);
+        const unsigned blueStart = p.light ? 0x0A7AFF : 0x2684FF;
+        const unsigned blueEnd = p.light ? 0x3A9BFF : 0x5BB6FF;
+        const bool isMuted = extra.muted || extra.volume == 0;
+        const Glyph spkGlyph = isMuted ? SpeakerMuted : (extra.volume >= 0 && extra.volume < 45) ? SpeakerLow : Speaker;
+        iconButton(sheet, p, box(34, 104, 34, 32), spkGlyph, [this] { changeVolume(0, true); }, isMuted);
+        const float qVol = barVolumeLevel >= 0.f ? std::clamp(barVolumeLevel, 0.f, 1.f)
+            : (extra.muted ? 0.f : std::max(0, extra.volume) / 100.f);
+        const Box volTrack = box(78, 114.5f, sheet.w - 166.f, 11.f);
+        quickVolumeTrack = volTrack;
+        if (extra.volume >= 0) hit(sheet, box(volTrack.left - 4.f, 102.f, width(volTrack) + 8.f, 36.f), [] {});
+        const float volHover = sheet.hoverAmount();
+        d.fill(volTrack, 5.5f, tint(p.light ? 0xD8D8DC : 0xFFFFFF, p.light ? 1.f : .14f));
+        const float fillW = width(volTrack) * qVol;
+        if (fillW > 0.5f) {
+            const float drawnW = std::max(height(volTrack), fillW);
+            d.gradient(box(volTrack.left, volTrack.top, std::min(width(volTrack), drawnW), height(volTrack)),
+                5.5f, tint(blueStart), tint(blueEnd), true);
         }
+        if (qVol > 0.005f || volumeDrag || volHover > 0.05f) {
+            const float kx = std::clamp(volTrack.left + std::max(5.5f, fillW - 5.5f), volTrack.left + 5.5f, volTrack.right - 5.5f);
+            const float thumbVis = volumeDrag ? 1.f : std::max(0.75f, volHover);
+            d.circle(kx, volTrack.top + 5.5f, volumeDrag ? 4.3f : 3.6f, tint(0xFFFFFF, .96f * thumbVis));
+        }
+        const int shownVol = extra.volume < 0 ? -1 : static_cast<int>(std::lround(qVol * 100.f));
+        d.text(extra.muted ? L"0%" : percentage(shownVol), box(volTrack.right + 8.f, 106.f, 44.f, 28.f), Strong,
+            tint(volumeDrag ? blueEnd : p.ink), Right);
+
+        // Output devices list
+        d.text(L"Çıkış aygıtları", box(26, 162, 240, 20), Caption, tint(p.muted));
+        constexpr int rows = 3;
+        const int devCount = static_cast<int>(extra.audioDevices.size());
+        listOffset = std::clamp(listOffset, 0, std::max(0, devCount - rows));
+        const auto rowHoverColor = [&](float hot) {
+            return tint(p.glass ? (p.light ? 0x10141A : 0xFFFFFF) : p.accent, (p.glass ? .075f : .12f) * hot);
+        };
+        for (int i = 0; i < rows && i + listOffset < devCount; ++i) {
+            const auto& dev = extra.audioDevices[i + listOffset];
+            const Box item = box(24, 186 + i * 44.f, sheet.w - 48, 38);
+            p.card(d, item, 11);
+            hit(sheet, item, [this, id = dev.id] { setAudioEndpoint(id); });
+            const float hot = sheet.hoverAmount();
+            if (dev.active) {
+                d.fill(item, 11, tint(p.accent, p.glass ? .20f : .14f));
+                d.outline(box(item.left + .5f, item.top + .5f, width(item) - 1.f, height(item) - 1.f), 10.5f, tint(p.accent, .62f));
+            } else if (hot > 0.f) {
+                d.fill(item, 11, rowHoverColor(hot));
+            }
+            d.icon(Speaker, box(36, item.top + 10, 18, 18), tint(dev.active ? p.accent : p.muted));
+            d.text(dev.name, box(62, item.top + 1, width(item) - 72.f, 36), Body, tint(p.ink));
+            if (dev.active) d.icon(Check, box(item.right - 28.f, item.top + 10, 17, 17), tint(p.accent));
+        }
+        if (devCount == 0) {
+            d.text(L"Etkin ses çıkış aygıtı bulunamadı.", box(24, 200, sheet.w - 48, 70), Body, tint(p.muted), Center);
+        }
+
+        const float fy = sheet.h - 48.f;
+        const float halfW = (sheet.w - 58.f) / 2.f;
+        button(sheet, p, box(24, fy, halfW, 34), L"Mikrofon", [this] { open(MicControl, panelDockX); });
+        button(sheet, p, box(24 + halfW + 10.f, fy, halfW, 34), L"Ses ayarları", [this] { launch(L"ms-settings:sound"); });
     } else if (page == OpenWindows) {
         heading(p, L"Açık pencereler", num(extra.windows.size()) + L" pencere");
         listOffset = std::clamp(listOffset, 0, std::max(0, static_cast<int>(extra.windows.size()) - 5));
@@ -973,7 +1352,8 @@ void Dock::extraPanel(Palette p) {
             tile(3, L"Yakın paylaşım", nsStatus, Link, extra.nearbyShare > 0,
                 [this] { openQuickSub(QuickSubPanel::NearbyShare); }, {}, true);
             tile(4, L"Kablosuz ekran", L"", Layers, false, [this] { systemShortcut('K'); });
-            tile(5, L"Bildirimler", L"", Sliders, false, [this] { systemShortcut('N'); });
+            tile(5, L"Bildirimler", extra.dndEnabled ? L"Rahatsız etme" : extra.notifications.empty() ? L"" : num(extra.notifications.size()) + L" yeni",
+                BellIcon, extra.dndEnabled, [this] { open(NotificationCenter, panelDockX); });
         }
         d.popMotion(qMotion);
         p.card(d, box(29, 257 + yOff, 380, 65), 14);

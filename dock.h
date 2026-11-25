@@ -513,6 +513,15 @@ public:
     void switchKeyboardLayout(HKL targetHkl);
     void cycleKeyboardLayout(int delta);
     void keyboardPanel(Palette p);
+    void notificationPanel(Palette p);
+    void networkPanel(Palette p);
+    void refreshNotifications(bool force = false);
+    void pollNotifications();
+    void dismissNotification(int64_t id);
+    void clearAllNotifications();
+    void activateNotification(const WinNotification& item);
+    void queryDoNotDisturb();
+    void toggleDoNotDisturb();
     void sampleNetworkFast();
     float statusBarWidth() const;
     float trailingWidth() const;

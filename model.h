@@ -41,7 +41,7 @@ enum Widget {
     ClaudeUsage, ClaudePlanUsage, GeminiUsage, GrokUsage, DeepSeekBalance, GlmUsage,
     OpenCodeUsage, OpenCodePlanUsage, CursorUsage, StartButton, AiLimitsTriple,
     DayTimeline, WhatsApp, Currency, MediaCompact, MediaMini, MediaBar, MicControl, QuickToggles, WidgetCount,
-    Studio = WidgetCount, ContextMenu, SystemTray, AppMenu, Overflow, ChromeWindows, KeyboardLang
+    Studio = WidgetCount, ContextMenu, SystemTray, AppMenu, Overflow, ChromeWindows, KeyboardLang, NotificationCenter, NetworkPanel
 };
 enum WidgetGroup { Workspace, Productivity, Device, Analytics, WeatherGroup, MarketGroup, AppGroup, AiGroup };
 enum Profile { Developer, Seller, Founder, Student, ProfileCount };
