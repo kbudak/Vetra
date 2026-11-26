@@ -22,7 +22,9 @@
 #include <mutex>
 #include <numeric>
 #include <sstream>
+#include <thread>
 #include <unordered_map>
+#include <utility>
 #include "dock.h"
 
 using Microsoft::WRL::ComPtr;
@@ -637,6 +639,7 @@ int Dock::refreshOpenWindows() {
             ordered.push_back(std::move(item));
         }
     }
+    const size_t newWindowStart = ordered.size();
     // Append newly opened windows at the end
     for (auto& w : discovered) {
         if (std::none_of(ordered.begin(), ordered.end(), [&](const OpenWindow& existing) { return existing.handle == w.handle; })) {
@@ -662,11 +665,40 @@ int Dock::refreshOpenWindows() {
             }
         }
     }
+    // Seed already-open Chrome windows once. The initial enumeration is front
+    // to back, so use its reverse for windows whose creation event was missed.
+    std::erase_if(chromeWindowOrder, [](HWND window) { return !IsWindow(window); });
+    for (size_t i = ordered.size(); i > newWindowStart; --i) {
+        const auto& window = ordered[i - 1];
+        if (isChromeApp(window.app)) rememberChromeWindow(window.handle);
+    }
     extra.windows = std::move(ordered);
     if (changed) pinnedWindowRevision = 0;
     requestWindowIcons();
     if (oldRunning != runningHwnds()) return 2;
     return changed ? 1 : 0;
+}
+
+namespace {
+struct SavedWindowBounds {
+    RECT rect{};
+    bool maximized = false;
+};
+
+std::unordered_map<HWND, SavedWindowBounds>& savedWindowBounds() {
+    static std::unordered_map<HWND, SavedWindowBounds> map;
+    return map;
+}
+
+bool isForegroundOrOwned(HWND target, HWND fg) {
+    if (!target || !fg) return false;
+    if (fg == target) return true;
+    if (GetAncestor(fg, GA_ROOT) == target) return true;
+    if (GetAncestor(fg, GA_ROOTOWNER) == target) return true;
+    if (GetWindow(fg, GW_OWNER) == target) return true;
+    if (IsChild(target, fg)) return true;
+    return false;
+}
 }
 
 void Dock::activateWindow(HWND target, bool toggleMinimize) {
@@ -676,24 +708,83 @@ void Dock::activateWindow(HWND target, bool toggleMinimize) {
         if (panel) paintSheet();
         return;
     }
+
+    auto& savedMap = savedWindowBounds();
+    std::erase_if(savedMap, [](const auto& entry) { return !IsWindow(entry.first); });
+
     const HWND fg = GetForegroundWindow();
-    const HWND fgRoot = fg ? GetAncestor(fg, GA_ROOTOWNER) : nullptr;
-    if (toggleMinimize && (fg == target || fgRoot == target) && !IsIconic(target)) {
-        ShowWindowAsync(target, SW_MINIMIZE);
+    if (toggleMinimize && isForegroundOrOwned(target, fg) && !IsIconic(target)) {
+        const bool zoomed = IsZoomed(target) != FALSE;
+        RECT preRect{};
+        if (zoomed) {
+            savedMap[target] = {{}, true};
+        } else if (GetWindowRect(target, &preRect) && !IsRectEmpty(&preRect)) {
+            savedMap[target] = {preRect, false};
+        }
+
+        if (!IsHungAppWindow(target)) {
+            SendMessageTimeoutW(target, WM_SYSCOMMAND, SC_MINIMIZE, 0,
+                SMTO_ABORTIFHUNG | SMTO_NORMAL, 120, nullptr);
+            if (!IsIconic(target) && !IsHungAppWindow(target)) ShowWindow(target, SW_MINIMIZE);
+            else if (!IsIconic(target)) ShowWindowAsync(target, SW_MINIMIZE);
+        } else {
+            ShowWindowAsync(target, SW_MINIMIZE);
+        }
+
+        for (auto& win : extra.windows) {
+            if (win.handle == target) win.active = false;
+        }
+        pinnedWindowRevision = 0;
+        paintBar();
         scheduleWindowSync();
         return;
     }
 
+    if (IsIconic(target)) {
+        const auto savedIt = savedMap.find(target);
+        const bool hasSaved = savedIt != savedMap.end();
+        const SavedWindowBounds saved = hasSaved ? savedIt->second : SavedWindowBounds{};
+
+        // Use native WM_SYSCOMMAND SC_RESTORE (same as Windows Taskbar) so maximized state,
+        // Windows Snap layouts, custom dimensions, and Chromium internal bounds stay intact.
+        if (!IsHungAppWindow(target)) {
+            SendMessageTimeoutW(target, WM_SYSCOMMAND, SC_RESTORE, 0,
+                SMTO_ABORTIFHUNG | SMTO_NORMAL, 200, nullptr);
+        }
+        if (IsIconic(target)) {
+            WINDOWPLACEMENT wp{sizeof(wp)};
+            const bool restoreMax = (hasSaved && saved.maximized) ||
+                (GetWindowPlacement(target, &wp) && (wp.flags & WPF_RESTORETOMAXIMIZED));
+            if (!IsHungAppWindow(target)) {
+                ShowWindow(target, restoreMax ? SW_SHOWMAXIMIZED : SW_SHOWNOACTIVATE);
+                if (IsIconic(target)) ShowWindow(target, restoreMax ? SW_SHOWMAXIMIZED : SW_RESTORE);
+            } else {
+                ShowWindowAsync(target, restoreMax ? SW_SHOWMAXIMIZED : SW_RESTORE);
+            }
+        }
+        if (hasSaved && !IsIconic(target)) {
+            if (saved.maximized && !IsZoomed(target)) {
+                ShowWindow(target, SW_SHOWMAXIMIZED);
+            } else if (!saved.maximized && !IsZoomed(target) && !IsRectEmpty(&saved.rect)) {
+                RECT afterRect{};
+                if (GetWindowRect(target, &afterRect) &&
+                    (std::abs(afterRect.left - saved.rect.left) > 2 ||
+                     std::abs(afterRect.top - saved.rect.top) > 2 ||
+                     std::abs((afterRect.right - afterRect.left) - (saved.rect.right - saved.rect.left)) > 2 ||
+                     std::abs((afterRect.bottom - afterRect.top) - (saved.rect.bottom - saved.rect.top)) > 2)) {
+                    if (MonitorFromRect(&saved.rect, MONITOR_DEFAULTTONULL) != nullptr) {
+                        SetWindowPos(target, nullptr, saved.rect.left, saved.rect.top,
+                            saved.rect.right - saved.rect.left, saved.rect.bottom - saved.rect.top,
+                            SWP_NOZORDER | SWP_NOACTIVATE);
+                    }
+                }
+            }
+            savedMap.erase(target);
+        }
+    }
+
     HWND focusTarget = GetLastActivePopup(target);
     if (!focusTarget || !IsWindow(focusTarget) || !IsWindowVisible(focusTarget)) focusTarget = target;
-
-    if (IsIconic(target)) {
-        WINDOWPLACEMENT wp{sizeof(wp)};
-        const int restoreCmd = (GetWindowPlacement(target, &wp) && (wp.flags & WPF_RESTORETOMAXIMIZED))
-            ? SW_SHOWMAXIMIZED : SW_RESTORE;
-        if (!IsHungAppWindow(target)) ShowWindow(target, restoreCmd);
-        else ShowWindowAsync(target, restoreCmd);
-    }
 
     DWORD targetPid = 0;
     const DWORD targetTid = GetWindowThreadProcessId(focusTarget, &targetPid);
@@ -715,7 +806,14 @@ void Dock::activateWindow(HWND target, bool toggleMinimize) {
     if (attachedFg) AttachThreadInput(myTid, fgTid, FALSE);
 
     if (!focused) {
-        SwitchToThisWindow(focusTarget, TRUE);
+        // Avoid SwitchToThisWindow (which sends SW_RESTORE and breaks snapped/custom sizes).
+        const bool alreadyTopmost = (GetWindowLongPtrW(focusTarget, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0;
+        if (!alreadyTopmost) {
+            SetWindowPos(focusTarget, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+            SetWindowPos(focusTarget, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+        } else {
+            SetWindowPos(focusTarget, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+        }
         SetForegroundWindow(focusTarget);
     }
     scheduleWindowSync();
@@ -844,30 +942,29 @@ static Text friendlyProcessName(DWORD pid) {
     return name;
 }
 
-void Dock::sampleMicrophone(bool toggle) {
-    extra.microphoneMute = -1;
-    extra.micDeviceName.clear();
-    extra.micActiveApps.clear();
-    if (!gAudioEnum && FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_INPROC_SERVER,
-        IID_PPV_ARGS(&gAudioEnum)))) return;
+static MicrophoneState readMicrophone(bool toggle) {
+    MicrophoneState result;
+    ComPtr<IMMDeviceEnumerator> enumerator;
+    if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_INPROC_SERVER,
+        IID_PPV_ARGS(&enumerator)))) return result;
     ComPtr<IMMDevice> device;
-    if (FAILED(gAudioEnum->GetDefaultAudioEndpoint(eCapture, eCommunications, &device)) &&
-        FAILED(gAudioEnum->GetDefaultAudioEndpoint(eCapture, eConsole, &device))) return;
+    if (FAILED(enumerator->GetDefaultAudioEndpoint(eCapture, eCommunications, &device)) &&
+        FAILED(enumerator->GetDefaultAudioEndpoint(eCapture, eConsole, &device))) return result;
     if (device) {
-        extra.micDeviceName = endpointName(*device.Get());
+        result.deviceName = endpointName(*device.Get());
         ComPtr<IAudioEndpointVolume> endpoint;
         if (SUCCEEDED(device->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL, nullptr,
             reinterpret_cast<void**>(endpoint.GetAddressOf()))) && endpoint) {
             BOOL muted{};
             if (SUCCEEDED(endpoint->GetMute(&muted))) {
                 if (toggle && SUCCEEDED(endpoint->SetMute(!muted, nullptr))) endpoint->GetMute(&muted);
-                extra.microphoneMute = muted != FALSE;
+                result.mute = muted != FALSE;
             }
         }
     }
     // Enumerate active recording sessions across all active capture endpoints
     ComPtr<IMMDeviceCollection> captures;
-    if (SUCCEEDED(gAudioEnum->EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE, &captures)) && captures) {
+    if (SUCCEEDED(enumerator->EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE, &captures)) && captures) {
         UINT devCount = 0;
         captures->GetCount(&devCount);
         for (UINT dIdx = 0; dIdx < devCount; ++dIdx) {
@@ -899,15 +996,62 @@ void Dock::sampleMicrophone(bool toggle) {
                     }
                 }
                 if (appName.empty()) appName = L"Uygulama";
-                if (std::none_of(extra.micActiveApps.begin(), extra.micActiveApps.end(), [&](const Text& existing) {
+                if (std::none_of(result.activeApps.begin(), result.activeApps.end(), [&](const Text& existing) {
                     return CompareStringOrdinal(existing.c_str(), -1, appName.c_str(), -1, TRUE) == CSTR_EQUAL;
                 })) {
-                    extra.micActiveApps.push_back(std::move(appName));
+                    result.activeApps.push_back(std::move(appName));
                 }
             }
         }
     }
-    if (toggle) { paintBar(); paintSheet(); }
+    return result;
+}
+
+void Dock::sampleMicrophone(bool toggle, bool refresh) {
+    if (!hwnd) return;
+    if (extra.micRequest.valid()) {
+        if (toggle) extra.micToggleQueued = !extra.micToggleQueued;
+        if (refresh) extra.micRefreshQueued = true;
+        return;
+    }
+    const auto stamp = GetTickCount64();
+    if (!toggle && !refresh && extra.lastMicPollAt && stamp - extra.lastMicPollAt < 2000) return;
+    extra.lastMicPollAt = stamp;
+    try {
+        std::packaged_task<MicrophoneState()> task([toggle] {
+            if (FAILED(CoInitializeEx(nullptr, COINIT_MULTITHREADED))) return MicrophoneState{};
+            struct Apartment { ~Apartment() { CoUninitialize(); } } apartment;
+            return readMicrophone(toggle);
+        });
+        auto result = task.get_future();
+        const HWND notify = hwnd;
+        const auto stop = extra.proStop;
+        std::thread([task = std::move(task), notify, stop]() mutable {
+            task();
+            if (!stop || !stop->load()) PostMessageW(notify, AsyncWake, 0, 0);
+        }).detach();
+        extra.micRequest = std::move(result);
+    } catch (const std::exception&) {}
+}
+
+bool Dock::pollMicrophone() {
+    if (!extra.micRequest.valid() ||
+        extra.micRequest.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return false;
+    const bool toggle = std::exchange(extra.micToggleQueued, false);
+    const bool refresh = std::exchange(extra.micRefreshQueued, false);
+    bool changed = false;
+    try {
+        auto result = extra.micRequest.get();
+        if (!toggle && !refresh) {
+            changed = result.mute != extra.microphoneMute || result.deviceName != extra.micDeviceName ||
+                result.activeApps != extra.micActiveApps;
+            extra.microphoneMute = result.mute;
+            extra.micDeviceName = std::move(result.deviceName);
+            extra.micActiveApps = std::move(result.activeApps);
+        }
+    } catch (const std::exception&) {}
+    if (toggle || refresh) sampleMicrophone(toggle, refresh);
+    return changed;
 }
 
 void Dock::sampleNetworkFast() {
@@ -1550,19 +1694,18 @@ void Dock::setVolumeLevel(float level, bool instant, bool dragging) {
 }
 void Dock::sampleExtras(bool immediate) {
     const auto enabled = [&](int id) { return page == id || (shown(id) && !isFoldedWidget(id)); };
-    const auto& sb = model.statusBar;
-    const bool sbMic = sb.enabled && sb.microphone;
-    const bool sbKey = sb.enabled && sb.keyboard;
-    const bool sbNet = sb.enabled && sb.network;
-    const bool sbVol = sb.enabled && sb.volume;
-    const bool sbBat = sb.enabled && sb.battery;
+    const bool sbMic = statusShown(StatusMic);
+    const bool sbKey = statusShown(StatusKeyboard);
+    const bool sbNet = statusShown(StatusNetwork);
+    const bool sbVol = statusShown(StatusVolume);
+    const bool sbBat = statusShown(StatusBattery);
     const auto stamp = GetTickCount64();
     if (enabled(NetworkWidget)) networkSample(extra, stamp);
     else extra.netAt = 0;
     if (enabled(Storage) && ((immediate && page == Storage) || !extra.lastDisks || stamp - extra.lastDisks >= 35000)) {
         extra.disks = localDisks(); extra.lastDisks = stamp;
     }
-    if (enabled(Power) || sbBat) {
+    if (enabled(Power) || (sbBat && immediate)) {
         SYSTEM_POWER_STATUS power{};
         if (GetSystemPowerStatus(&power)) {
             battery = power.BatteryLifePercent == 255 ? -1 : power.BatteryLifePercent;
@@ -1584,10 +1727,10 @@ void Dock::sampleExtras(bool immediate) {
             }
         }
     }
-    if (enabled(MicControl) || sbMic) sampleMicrophone();
+    if (enabled(MicControl) || sbMic) sampleMicrophone(false, immediate && page == MicControl);
     if (sbKey || page == KeyboardLang) sampleKeyboardLayout();
-    if (sbNet) sampleNetworkFast();
-    if ((sb.enabled && sb.notifications) || page == NotificationCenter) refreshNotifications(immediate && page == NotificationCenter);
+    if (sbNet && immediate) sampleNetworkFast();
+    if ((statusShown(StatusNotifications)) || page == NotificationCenter) refreshNotifications(immediate && page == NotificationCenter);
     if (page == Quick || enabled(QuickToggles) ||
         (sbNet && (immediate || !extra.lastRadioPollAt || stamp - extra.lastRadioPollAt >= 10000))) {
         extra.lastRadioPollAt = stamp;
@@ -2320,7 +2463,7 @@ void Dock::refreshMicEndpoints() {
 void Dock::setMicEndpoint(const Text& deviceId) {
     if (deviceId.empty()) return;
     if (setDefaultAudioEndpointId(deviceId)) {
-        sampleMicrophone();
+        sampleMicrophone(false, true);
         refreshMicEndpoints();
         paintBar();
         paintSheet();
@@ -2544,6 +2687,7 @@ void Dock::toggleTile(int id) {
     auto tile = std::find_if(layout.begin(), layout.end(), [id](Tile item) { return item.id == id; });
     if (tile == layout.end()) return;
     tile->enabled = !tile->enabled;
+    if (tile->enabled && statusWidget(id)) model.statusBar.enabled = true;
     if (tile->enabled && (id == System || id == CpuMeter || id == RamMeter || id == Git)) sample();
     if (tile->enabled) {
         sampleExtras(true);
@@ -2598,7 +2742,7 @@ bool Dock::tickExtras(ULONGLONG stamp, const SYSTEMTIME& local) {
         const int prevBt = extra.radios.bluetooth;
         try { extra.radios = extra.radioRequest.get(); }
         catch (const std::exception&) { extra.radios.denied = true; }
-        if (shown(QuickToggles) || (model.statusBar.enabled && model.statusBar.network) || page == NetworkPanel) dirty = true;
+        if (shown(QuickToggles) || (statusShown(StatusNetwork)) || page == NetworkPanel) dirty = true;
         if (page == Quick || page == NetworkPanel) {
             refreshWifi(false, page == NetworkPanel || extra.quickSub == QuickSubPanel::Wifi);
             if (page == Quick && extra.quickSub == QuickSubPanel::Bluetooth && (extra.radios.bluetooth != prevBt || extra.btDevices.empty()))

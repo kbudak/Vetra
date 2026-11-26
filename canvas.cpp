@@ -1,4 +1,5 @@
 #include "canvas.h"
+#include <string_view>
 #include <tuple>
 #include "design.h"
 #include <cmath>
@@ -60,7 +61,17 @@ constexpr size_t ChartCacheSize = 16;
 ChartGeoEntry gChartCache[ChartCacheSize]{};
 uint64_t gChartClock = 0;
 
-int gTextAlignCache[FontCount];
+struct TextLayoutEntry {
+    Text text;
+    float width = 0.f, height = 0.f;
+    ::Font font = Small;
+    Alignment alignment = Left;
+    Microsoft::WRL::ComPtr<IDWriteTextLayout> layout;
+    uint64_t stamp = 0;
+};
+constexpr size_t TextLayoutSets = 128, TextLayoutWays = 4;
+std::array<std::array<TextLayoutEntry, TextLayoutWays>, TextLayoutSets> gTextLayouts{};
+uint64_t gTextLayoutClock = 0;
 
 struct FitCacheEntry {
     ::Font preferred = Small, fallback = Small, result = Small;
@@ -95,6 +106,9 @@ void clearStaticCaches() {
     drop(gRainCloudGeo);
     drop(gPlaySolidGeo);
     drop(gSkipSolidGeo);
+    for (auto& set : gTextLayouts)
+        for (auto& entry : set) entry = {};
+    gTextLayoutClock = 0;
     for (auto& entry : gFitCache) {
         entry.text.clear();
         entry.availQ = -1;
@@ -286,7 +300,6 @@ bool Draw::initialize() {
         DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_WEIGHT_SEMI_BOLD
     };
     for (int i = 0; i < FontCount; ++i) {
-        gTextAlignCache[i] = -1;
         if (FAILED(writing->CreateTextFormat(L"Segoe UI", nullptr, weights[i], DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
                 sizes[i], L"tr-TR", &textFormats[i])))
             return false;
@@ -780,14 +793,42 @@ void Draw::text(const Text& value, Box b, ::Font font, Color color, Alignment al
     if (value.empty() || width(b) < 1 || height(b) < 1) return;
     b = snap(b);
     constexpr DWRITE_TEXT_ALIGNMENT map[] = {DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_TRAILING};
-    if (gTextAlignCache[font] != static_cast<int>(alignment)) {
-        textFormats[font]->SetTextAlignment(map[alignment]);
-        gTextAlignCache[font] = static_cast<int>(alignment);
-    }
-    auto end = value.find_first_of(L"\r\n");
-    UINT32 length = static_cast<UINT32>(std::min(value.size(), end));
+    const std::wstring_view text{value.data(), std::min(value.size(), value.find_first_of(L"\r\n"))};
+    if (text.empty()) return;
+    const float w = width(b), h = height(b);
     brush->SetColor(d2dColor(color));
-    target->DrawText(value.c_str(), length, textFormats[font], d2dRect(b), brush, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
+    if (text.size() <= 256) {
+        const size_t hash = std::hash<std::wstring_view>{}(text) ^ (std::hash<float>{}(w) >> 3) ^
+            (std::hash<float>{}(h) >> 7) ^ (static_cast<size_t>(font) * 17 + alignment);
+        auto& set = gTextLayouts[hash % TextLayoutSets];
+        auto* entry = &set.front();
+        for (auto& candidate : set) {
+            if (candidate.layout && candidate.width == w && candidate.height == h &&
+                candidate.font == font && candidate.alignment == alignment && candidate.text == text) {
+                candidate.stamp = ++gTextLayoutClock;
+                target->DrawTextLayout({b.left, b.top}, candidate.layout.Get(), brush, D2D1_DRAW_TEXT_OPTIONS_CLIP);
+                return;
+            }
+            if (candidate.stamp < entry->stamp) entry = &candidate;
+        }
+        Microsoft::WRL::ComPtr<IDWriteTextLayout> layout;
+        if (SUCCEEDED(writing->CreateTextLayout(text.data(), static_cast<UINT32>(text.size()), textFormats[font],
+                w, h, &layout)) && SUCCEEDED(layout->SetTextAlignment(map[alignment]))) {
+            entry->text.assign(text);
+            entry->width = w;
+            entry->height = h;
+            entry->font = font;
+            entry->alignment = alignment;
+            entry->layout = std::move(layout);
+            entry->stamp = ++gTextLayoutClock;
+            target->DrawTextLayout({b.left, b.top}, entry->layout.Get(), brush, D2D1_DRAW_TEXT_OPTIONS_CLIP);
+            return;
+        }
+    }
+    textFormats[font]->SetTextAlignment(map[alignment]);
+    target->DrawText(text.data(), static_cast<UINT32>(text.size()), textFormats[font], d2dRect(b), brush,
+        D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
+    textFormats[font]->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
 }
 void Draw::line(float x, float y, float toX, float toY, Color c, float stroke) {
     brush->SetColor(d2dColor(c));

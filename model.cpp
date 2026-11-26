@@ -110,7 +110,7 @@ Model::Model() {
         for (int id : defaults[p]) if (id >= 0) layouts[p].push_back({id, true});
         for (int id = 0; id < WidgetCount; ++id) {
             if (std::none_of(layouts[p].begin(), layouts[p].end(), [=](Tile t) { return t.id == id; }))
-                layouts[p].push_back({id, false});
+                layouts[p].push_back({id, dockControlWidget(id)});
         }
     }
     shortcuts = {{L"Dosyalar", L"explorer.exe"}, {L"Web", L"https://www.google.com/"}, {L"Terminal", L"cmd.exe"}, {L"Not Defteri", L"notepad.exe"}};
@@ -139,6 +139,8 @@ void Model::load() {
     };
     std::array<std::vector<Tile>, ProfileCount> stored;
     std::array<std::vector<DockSlot>, ProfileCount> storedSlots;
+    std::array<bool, StatusNotifications - StatusMic + 1> legacyStatus{};
+    legacyStatus.fill(true);
     while (std::getline(input, line)) {
         std::istringstream row(line);
         std::string type, a, b;
@@ -161,9 +163,8 @@ void Model::load() {
         } else if (type == "accent") {
             row >> accent;
         } else if (type == "statusBar") {
-            row >> statusBar.enabled >> statusBar.microphone >> statusBar.micOnlyInUse
-                >> statusBar.keyboard >> statusBar.network >> statusBar.volume
-                >> statusBar.battery >> statusBar.clock >> statusBar.notifications;
+            row >> statusBar.enabled >> legacyStatus[0] >> statusBar.micOnlyInUse;
+            for (size_t i = 1; i < legacyStatus.size(); ++i) row >> legacyStatus[i];
         } else if (type == "taskbar") {
             row >> hideTaskbar;
         } else if (type == "widgets") {
@@ -172,11 +173,12 @@ void Model::load() {
             for (auto& symbol : stockSymbols) if (row >> std::quoted(a)) symbol = utf16(a);
             if (row >> std::quoted(a)) cryptoSymbol = utf16(a);
         } else if (type == "aiPair") {
-            int first, second;
+            int first, second, triple = -1;
             if (row >> first >> second && first >= 0 && first < AiPlanCount &&
                 second >= 0 && second < AiPlanCount) {
                 aiLimitFirst = first;
                 aiLimitSecond = first != second ? second : first == 0 ? 1 : 0;
+                if (row >> triple) aiLimitTriple = (triple != 0);
             }
         } else if (type == "aiPlan") {
             int idx = -1;
@@ -289,6 +291,7 @@ void Model::load() {
             const bool hadStart = std::any_of(stored[p].begin(), stored[p].end(),
                 [](Tile current) { return current.id == StartButton; });
             for (auto tile : layouts[p]) {
+                if (statusWidget(tile.id)) tile.enabled = legacyStatus[tile.id - StatusMic];
                 if (std::none_of(stored[p].begin(), stored[p].end(), [=](Tile current) { return current.id == tile.id; })) {
                     if (tile.id == StartButton) stored[p].insert(stored[p].begin(), tile);
                     else stored[p].push_back(tile);
@@ -299,6 +302,9 @@ void Model::load() {
                 std::none_of(storedSlots[p].begin(), storedSlots[p].end(), [](const DockSlot& s) { return !s.isApp && s.widget == StartButton; })) {
                 storedSlots[p].insert(storedSlots[p].begin(), {false, StartButton, {}});
             }
+        } else {
+            for (auto& tile : layouts[p])
+                if (statusWidget(tile.id)) tile.enabled = legacyStatus[tile.id - StatusMic];
         }
         if (!storedSlots[p].empty()) dockOrder[p] = std::move(storedSlots[p]);
     }
@@ -341,15 +347,19 @@ bool Model::save() const {
     out << "Vetra 1\nappearance " << profile << ' ' << theme << ' ' << (48 + (opacity * 52 + 50) / 100) << ' ' << size << ' ' << edge << ' '
         << alignment << " 0 0 " << topmost << " 1 " << focusMinutes << ' ' << glassTheme(theme) << ' ' << autoHides() << ' ' << opacity << ' ' << (visibility == DockVisibility::Reserved) << '\n';
     out << "accent " << accent << '\n';
-    out << "statusBar " << statusBar.enabled << ' ' << statusBar.microphone << ' ' << statusBar.micOnlyInUse
-        << ' ' << statusBar.keyboard << ' ' << statusBar.network << ' ' << statusBar.volume
-        << ' ' << statusBar.battery << ' ' << statusBar.clock << ' ' << statusBar.notifications << '\n';
+    const auto enabledStatus = [&](int id) {
+        const auto& layout = layouts[profile];
+        return std::any_of(layout.begin(), layout.end(), [id](Tile tile) { return tile.id == id && tile.enabled; });
+    };
+    out << "statusBar " << statusBar.enabled << ' ' << enabledStatus(StatusMic) << ' ' << statusBar.micOnlyInUse;
+    for (int id = StatusKeyboard; id <= StatusNotifications; ++id) out << ' ' << enabledStatus(id);
+    out << '\n';
     out << "taskbar " << hideTaskbar << '\n';
     out << "widgets " << countdownMinutes << ' ' << worldCity << ' ' << weatherCity << '\n';
     out << "market";
     for (const auto& symbol : stockSymbols) out << ' ' << std::quoted(utf8(symbol));
     out << ' ' << std::quoted(utf8(cryptoSymbol)) << '\n';
-    out << "aiPair " << aiLimitFirst << ' ' << aiLimitSecond << '\n';
+    out << "aiPair " << aiLimitFirst << ' ' << aiLimitSecond << ' ' << (aiLimitTriple ? 1 : 0) << '\n';
     for (int i = 0; i < AiPlanCount; ++i) {
         const auto& ov = aiOverrides[i];
         if (ov.p1 >= 0 || ov.p2 >= 0 || ov.p3 >= 0 || !ov.r1.empty() || !ov.r2.empty() || !ov.r3.empty() ||

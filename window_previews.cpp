@@ -1,6 +1,8 @@
 #include "dock.h"
 #include <dwmapi.h>
 #include <chrono>
+#include <mutex>
+#include <unordered_map>
 
 namespace {
 using namespace std::chrono_literals;
@@ -10,9 +12,42 @@ constexpr float SidePadding = 16.f, CardTop = 14.f, BottomPadding = 16.f;
 constexpr float NavigationHeight = 31.f;
 constexpr int MaxVisibleCards = 4;
 
+std::mutex gPreviewCacheMutex;
+std::unordered_map<HWND, std::shared_ptr<Gdiplus::Bitmap>> gPreviewCache;
+
+std::shared_ptr<Gdiplus::Bitmap> lookupPreviewCache(HWND window) {
+    std::lock_guard lock(gPreviewCacheMutex);
+    const auto it = gPreviewCache.find(window);
+    return it != gPreviewCache.end() ? it->second : std::shared_ptr<Gdiplus::Bitmap>{};
+}
+
+void storePreviewCache(HWND window, const std::shared_ptr<Gdiplus::Bitmap>& bmp) {
+    if (!window || !bmp) return;
+    std::lock_guard lock(gPreviewCacheMutex);
+    std::erase_if(gPreviewCache, [](const auto& entry) { return !IsWindow(entry.first); });
+    gPreviewCache[window] = bmp;
+}
+
 int visibleCards(float panelWidth) {
     return std::clamp(static_cast<int>((panelWidth - 2 * SidePadding + CardGap + .1f) /
         (CardWidth + CardGap)), 1, MaxVisibleCards);
+}
+
+bool hasRenderedContent(const DWORD* pixels, int w, const RECT& source) {
+    const int sourceW = source.right - source.left, sourceH = source.bottom - source.top;
+    if (sourceW < 8 || sourceH < 8) return false;
+    const auto color = [&](int x, int y) { return pixels[static_cast<size_t>(y) * w + x] & 0x00FFFFFFu; };
+    const int left = source.left + std::min(6, sourceW / 8);
+    const int top = source.top + std::min(6, sourceH / 8);
+    const int right = source.right - std::min(6, sourceW / 8);
+    const int bottom = source.bottom - std::min(6, sourceH / 8);
+    const DWORD first = color(left, top);
+    const int stepY = std::max(1, (bottom - top) / 28);
+    const int stepX = std::max(1, (right - left) / 28);
+    for (int y = top; y < bottom; y += stepY)
+        for (int x = left; x < right; x += stepX)
+            if (color(x, y) != first) return true;
+    return false;
 }
 
 std::shared_ptr<Gdiplus::Bitmap> captureWindowPreview(HWND window) {
@@ -28,6 +63,7 @@ std::shared_ptr<Gdiplus::Bitmap> captureWindowPreview(HWND window) {
     }
     OffsetRect(&source, -bounds.left, -bounds.top);
     const int sourceW = source.right - source.left, sourceH = source.bottom - source.top;
+    if (sourceW < 16 || sourceH < 16) return {};
 
     BITMAPINFO info{};
     info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
@@ -38,57 +74,101 @@ std::shared_ptr<Gdiplus::Bitmap> captureWindowPreview(HWND window) {
     void* bits{};
     const HBITMAP buffer = CreateDIBSection(nullptr, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
     if (!buffer) return {};
-    std::fill_n(static_cast<DWORD*>(bits), static_cast<size_t>(w) * h, 0);
+    const size_t pixelCount = static_cast<size_t>(w) * h;
+    std::fill_n(static_cast<DWORD*>(bits), pixelCount, 0);
     const HDC dc = CreateCompatibleDC(nullptr);
     const auto old = dc ? SelectObject(dc, buffer) : nullptr;
     constexpr UINT renderFullContent = 2;
-    const bool captured = old && PrintWindow(window, dc, renderFullContent);
+    bool captured = old && PrintWindow(window, dc, renderFullContent);
     GdiFlush();
+    const auto* pixels = static_cast<const DWORD*>(bits);
+    bool rendered = captured && hasRenderedContent(pixels, w, source);
+    if (!rendered && old) {
+        std::fill_n(static_cast<DWORD*>(bits), pixelCount, 0);
+        captured = PrintWindow(window, dc, 0) != FALSE;
+        GdiFlush();
+        rendered = captured && hasRenderedContent(pixels, w, source);
+    }
     if (old) SelectObject(dc, old);
     if (dc) DeleteDC(dc);
 
     std::shared_ptr<Gdiplus::Bitmap> preview;
-    if (captured) {
-        // An occluded browser can return a flat placeholder below its toolbar.
-        const auto* pixels = static_cast<const DWORD*>(bits);
-        const auto color = [&](int x, int y) { return pixels[static_cast<size_t>(y) * w + x] & 0x00FFFFFF; };
-        const int top = source.top + sourceH / 4, left = source.left + sourceW / 16;
-        const auto first = color(left, top);
-        bool rendered = false;
-        for (int y = top; y < source.bottom - sourceH / 16 && !rendered; y += std::max(1, sourceH / 24))
-            for (int x = left; x < source.right - sourceW / 16 && !rendered; x += std::max(1, sourceW / 24))
-                rendered = color(x, y) != first;
-        if (rendered) {
-            using namespace Gdiplus;
-            Bitmap capture(w, h, w * 4, PixelFormat32bppRGB, static_cast<BYTE*>(bits));
-            const float scale = std::min({1.f, 384.f / sourceW, 216.f / sourceH});
-            const int thumbW = std::max(1, static_cast<int>(sourceW * scale));
-            const int thumbH = std::max(1, static_cast<int>(sourceH * scale));
-            auto image = std::make_shared<Bitmap>(thumbW, thumbH, PixelFormat32bppPARGB);
-            Graphics graphics(image.get());
-            graphics.SetInterpolationMode(InterpolationModeHighQualityBicubic);
-            graphics.SetPixelOffsetMode(PixelOffsetModeHalf);
-            if (graphics.DrawImage(&capture, Rect(0, 0, thumbW, thumbH), source.left, source.top,
-                sourceW, sourceH, UnitPixel) == Ok) preview = std::move(image);
-        }
+    if (rendered) {
+        using namespace Gdiplus;
+        Bitmap capture(w, h, w * 4, PixelFormat32bppRGB, static_cast<BYTE*>(bits));
+        const float scale = std::min({1.f, 384.f / sourceW, 216.f / sourceH});
+        const int thumbW = std::max(1, static_cast<int>(sourceW * scale));
+        const int thumbH = std::max(1, static_cast<int>(sourceH * scale));
+        auto image = std::make_shared<Bitmap>(thumbW, thumbH, PixelFormat32bppPARGB);
+        Graphics graphics(image.get());
+        graphics.SetInterpolationMode(InterpolationModeHighQualityBicubic);
+        graphics.SetPixelOffsetMode(PixelOffsetModeHalf);
+        if (graphics.DrawImage(&capture, Rect(0, 0, thumbW, thumbH), source.left, source.top,
+            sourceW, sourceH, UnitPixel) == Ok) preview = std::move(image);
     }
     DeleteObject(buffer);
+    if (preview) storePreviewCache(window, preview);
     return preview;
 }
 }
 
+void Dock::rememberChromeWindow(HWND window) {
+    if (std::find(chromeWindowOrder.begin(), chromeWindowOrder.end(), window) == chromeWindowOrder.end())
+        chromeWindowOrder.push_back(window);
+}
+
 bool Dock::syncChromeWindows(bool renew) {
+    std::vector<const OpenWindow*> matched;
+    auto pushChromeGroup = [&]() {
+        for (const HWND window : chromeWindowOrder) {
+            const auto found = std::find_if(extra.windows.begin(), extra.windows.end(), [window](const OpenWindow& item) {
+                return item.handle == window;
+            });
+            if (found != extra.windows.end() && isChromeApp(found->app) && IsWindow(window))
+                matched.push_back(&*found);
+        }
+    };
+
+    if (previewTarget.kind == OrderKind::Shortcut) {
+        if (previewTarget.index >= 0 && static_cast<size_t>(previewTarget.index) < model.shortcuts.size()) {
+            const auto& app = model.shortcuts[static_cast<size_t>(previewTarget.index)];
+            if (isChromeApp(app)) {
+                pushChromeGroup();
+            } else {
+                for (const auto& item : extra.windows) {
+                    if (IsWindow(item.handle) && pinnedIndex(item.app) == previewTarget.index)
+                        matched.push_back(&item);
+                }
+            }
+        }
+    } else if (previewTarget.kind == OrderKind::Window) {
+        const auto found = std::find_if(extra.windows.begin(), extra.windows.end(),
+            [&](const OpenWindow& item) { return item.handle == previewTarget.window; });
+        if (found != extra.windows.end() && IsWindow(found->handle)) {
+            if (isChromeApp(found->app)) pushChromeGroup();
+            else matched.push_back(&*found);
+        }
+    }
+
     std::vector<WindowPreview> current;
-    for (const auto& item : extra.windows) {
-        if (!isChromeApp(item.app) || !IsWindow(item.handle)) continue;
+    current.reserve(matched.size());
+    for (const OpenWindow* ptr : matched) {
+        const auto& item = *ptr;
         const bool minimized = IsIconic(item.handle) != FALSE;
         const auto cached = std::find_if(chromeWindows.begin(), chromeWindows.end(), [&](const WindowPreview& entry) {
             return entry.window == item.handle && entry.title == item.title;
         });
         const bool hasCache = cached != chromeWindows.end();
+        std::shared_ptr<Gdiplus::Bitmap> bmp = hasCache ? cached->preview : nullptr;
+        if (!bmp) bmp = lookupPreviewCache(item.handle);
+        std::shared_ptr<Gdiplus::Bitmap> icon = item.icon;
+        if (!icon && previewTarget.kind == OrderKind::Shortcut &&
+            previewTarget.index >= 0 && static_cast<size_t>(previewTarget.index) < appImages.size()) {
+            icon = appImages[static_cast<size_t>(previewTarget.index)];
+        }
         current.push_back({item.handle, item.title, item.active, minimized,
             !renew && hasCache && cached->minimized == minimized && cached->requested,
-            item.icon, hasCache ? cached->preview : nullptr});
+            std::move(icon), std::move(bmp)});
     }
     const bool changed = !std::equal(current.begin(), current.end(), chromeWindows.begin(), chromeWindows.end(),
         [](const WindowPreview& a, const WindowPreview& b) {
@@ -99,20 +179,67 @@ bool Dock::syncChromeWindows(bool renew) {
     return changed;
 }
 
-void Dock::showChromeWindows(float x, bool hover) {
-    if (panel && page == ChromeWindows && !sheetClosing) {
+void Dock::activateAppDock(OrderItem item, HWND fallback, float x) {
+    const OrderItem prevTarget = previewTarget;
+    previewTarget = item;
+    syncChromeWindows(false);
+    const size_t count = chromeWindows.size();
+    if (count == 1 && IsWindow(chromeWindows[0].window)) {
+        const HWND only = chromeWindows[0].window;
+        chromeIconHovered = true;
+        hoverPreviewOrder = item;
+        chromeHoverSince = 0;
+        if (panel && page == ChromeWindows) closeSheet();
+        else previewTarget = prevTarget;
+        activateWindow(only, true);
+        return;
+    }
+    if (count > 1) {
+        previewTarget = prevTarget;
+        showWindowPreviews(item, x, false);
+        return;
+    }
+    previewTarget = prevTarget;
+    if (fallback && IsWindow(fallback)) {
+        chromeIconHovered = true;
+        hoverPreviewOrder = item;
+        chromeHoverSince = 0;
+        if (panel && page == ChromeWindows) closeSheet();
+        activateWindow(fallback, true);
+    }
+}
+
+void Dock::showWindowPreviews(OrderItem target, float x, bool hover) {
+    if (panel && page == ChromeWindows && !sheetClosing && previewTarget == target) {
         if (!hover && chromeHoverPanel) {
             chromeHoverPanel = false;
             SetForegroundWindow(panel);
         } else if (!hover) {
             chromeIconHovered = true;
+            hoverPreviewOrder = target;
             chromeHoverSince = 0;
             close();
         }
         return;
     }
+    const bool switchingHover = hover && panel && page == ChromeWindows && !sheetClosing && chromeHoverPanel;
+    previewTarget = target;
+    listOffset = 0;
     syncChromeWindows(true);
-    if (chromeWindows.empty()) return;
+    if (chromeWindows.empty()) {
+        previewTarget = {};
+        if (switchingHover) close();
+        return;
+    }
+    if (switchingHover) {
+        chromeLeftAt = 0;
+        panelDockX = x;
+        sheet.hover = sheet.key = -1;
+        positionSheet(false);
+        paintSheet();
+        updateChromePreviews();
+        return;
+    }
     if (sheetClosing) closeSheet();
     chromeHoverPanel = hover;
     chromeLeftAt = 0;
@@ -132,24 +259,37 @@ void Dock::updateChromeHover() {
     GetCursorPos(&cursor);
     const HWND hovered = WindowFromPoint(cursor);
     bool overIcon = false;
+    OrderItem overOrder{};
     float anchor = 0;
     if (hovered == bar.hwnd && !hidden && !dockEditMode && !dockDragging && !dockOrderSource && !modal) {
         ScreenToClient(bar.hwnd, &cursor);
         const int index = bar.at(cursor.x, cursor.y);
         if (index >= 0) {
             const auto& hit = bar.hits[index];
-            overIcon = hit.chromePreview;
-            anchor = (hit.bounds.left + hit.bounds.right) / 2;
+            overIcon = hit.windowPreview && static_cast<bool>(hit.order);
+            if (overIcon) {
+                overOrder = hit.order;
+                anchor = (hit.bounds.left + hit.bounds.right) / 2;
+            }
         }
     }
-    if (overIcon != chromeIconHovered) {
+    const bool showing = panel && page == ChromeWindows && chromeHoverPanel && !sheetClosing;
+    if (showing && overIcon && overOrder != previewTarget) {
+        chromeIconHovered = true;
+        hoverPreviewOrder = overOrder;
+        chromeHoverSince = 0;
+        showWindowPreviews(overOrder, anchor, true);
+        return;
+    }
+    if (overIcon != chromeIconHovered || (overIcon && overOrder != hoverPreviewOrder)) {
         chromeIconHovered = overIcon;
+        hoverPreviewOrder = overIcon ? overOrder : OrderItem{};
         chromeHoverSince = overIcon ? stamp : 0;
     }
-    const bool showing = panel && page == ChromeWindows && chromeHoverPanel && !sheetClosing;
-    if (!panel && overIcon && chromeHoverSince && stamp - chromeHoverSince >= openDelay) {
+    const bool canOpen = !panel || (page == ChromeWindows && sheetClosing);
+    if (canOpen && overIcon && chromeHoverSince && stamp - chromeHoverSince >= openDelay) {
         chromeHoverSince = 0;
-        showChromeWindows(anchor, true);
+        showWindowPreviews(overOrder, anchor, true);
         return;
     }
     if (showing) {
@@ -158,6 +298,7 @@ void Dock::updateChromeHover() {
         else if (stamp - chromeLeftAt >= closeDelay) close();
     } else if (!overIcon || (panel && page != ChromeWindows)) {
         chromeIconHovered = false;
+        hoverPreviewOrder = {};
         chromeHoverSince = 0;
         KillTimer(hwnd, ChromeHoverTick);
         chromeHoverTracking = false;
@@ -179,7 +320,7 @@ void Dock::updateChromePreviews() {
         for (auto& capture : chromePreviewRead.get()) {
             if (!capture.preview) continue;
             const auto current = std::find_if(chromeWindows.begin(), chromeWindows.end(), [&](const WindowPreview& entry) {
-                return entry.window == capture.window && entry.title == capture.title;
+                return entry.window == capture.window;
             });
             if (current != chromeWindows.end()) {
                 current->preview = std::move(capture.preview);
@@ -238,12 +379,16 @@ void Dock::chromeWindowsPanel(Palette p) {
         const auto& item = chromeWindows[i];
         const float x = SidePadding + (CardWidth + CardGap) * (i - listOffset);
         const auto card = box(x, CardTop, CardWidth, CardHeight);
+        const int cardHitIdx = static_cast<int>(sheet.hits.size());
         hit(sheet, card, [this, target = item.window] {
-            close();
-            activateWindow(target);
+            chromeIconHovered = true;
+            chromeHoverSince = 0;
+            closeSheet();
+            activateWindow(target, false);
         });
         const float hot = sheet.hoverAmount();
         const float down = sheet.pressAmount();
+        const bool overCard = sheet.hover == cardHitIdx || sheet.hover == cardHitIdx + 1;
         D2D1::Matrix3x2F cp{};
         const bool xform = hot > 0.01f || down > 0.01f;
         if (xform) {
@@ -264,9 +409,9 @@ void Dock::chromeWindowsPanel(Palette p) {
         }
 
         const auto icon = d.snap(box(x + 11, CardTop + 10, 17, 17));
-        if (item.icon) d.image(item.icon, icon);
-        else d.icon(Globe, icon, tint(p.muted));
-        d.text(item.title, box(x + 36, CardTop + 6, CardWidth - 46, 26), Caption, tint(p.ink));
+        if (item.icon) d.image(item.icon, icon, p.light);
+        else d.icon(Layers, icon, tint(p.muted));
+        d.text(item.title, box(x + 36, CardTop + 6, CardWidth - 66, 26), Caption, tint(p.ink));
 
         const auto frame = box(x + 10, CardTop + 37, CardWidth - 20, CardHeight - 47);
         d.fill(frame, 6, tint(p.base));
@@ -276,11 +421,40 @@ void Dock::chromeWindowsPanel(Palette p) {
             const float scale = std::min((width(frame) - 6) / w, (height(frame) - 6) / h);
             d.image(item.preview, box(frame.left + (width(frame) - w * scale) / 2,
                 frame.top + (height(frame) - h * scale) / 2, w * scale, h * scale));
+        } else if (item.icon) {
+            const float sz = 36.f;
+            const float iy = frame.top + (height(frame) - (item.minimized ? sz + 18.f : sz)) / 2.f;
+            d.image(item.icon, d.snap(box(frame.left + (width(frame) - sz) / 2.f, iy, sz, sz)), p.light);
+            if (item.minimized) {
+                d.text(L"Küçültüldü", box(frame.left + 8, iy + sz + 4, width(frame) - 16, 16), Micro, tint(p.muted), Center);
+            }
         } else {
             d.icon(ScreenIcon, box(frame.left + (width(frame) - 28) / 2,
                 frame.top + (height(frame) - 28) / 2, 28, 28), tint(p.muted, .70f));
         }
         if (xform) d.target->SetTransform(cp);
+
+        const Box closeBtn = box(x + CardWidth - 26.f, CardTop + 8.f, 20.f, 20.f);
+        hit(sheet, closeBtn, [this, target = item.window] {
+            closeAppWindows({target});
+            std::erase_if(chromeWindows, [target](const WindowPreview& entry) { return entry.window == target; });
+            if (chromeWindows.empty()) {
+                closeSheet();
+            } else {
+                sheet.hover = sheet.key = -1;
+                positionSheet(false);
+                paintSheet();
+            }
+        });
+        const float closeHot = sheet.hoverAmount();
+        if (overCard || closeHot > 0.01f) {
+            if (closeHot > 0.01f) d.fill(closeBtn, 6.f, tint(Design::Red, .85f * closeHot));
+            else d.fill(closeBtn, 6.f, tint(p.ink, p.light ? .08f : .10f));
+            const float cx = closeBtn.left + 10.f, cy = closeBtn.top + 10.f;
+            const auto xCol = closeHot > 0.25f ? tint(0xFFFFFF, .96f) : tint(p.muted, .92f);
+            d.line(cx - 3.5f, cy - 3.5f, cx + 3.5f, cy + 3.5f, xCol, 1.35f);
+            d.line(cx + 3.5f, cy - 3.5f, cx - 3.5f, cy + 3.5f, xCol, 1.35f);
+        }
     }
     if (count > visible) {
         const float y = CardTop + CardHeight + 3.f, mid = sheet.w / 2;

@@ -188,9 +188,11 @@ bool writeCred(const wchar_t* target, const Text& val) {
     return CredWriteW(&entry, 0) != FALSE;
 }
 
-Text httpGet(const wchar_t* domain, const Text& path, const Text& authHeader = {}, size_t maxBytes = 512 * 1024) {
+Text httpGetEx(const wchar_t* domain, const Text& path, const Text& extraHeaders = {}, size_t maxBytes = 512 * 1024,
+               const wchar_t* userAgent = L"Vetra/1.2", DWORD* outStatus = nullptr) {
+    if (outStatus) *outStatus = 0;
     struct H { HINTERNET h{}; ~H() { if (h) WinHttpCloseHandle(h); } operator HINTERNET() const { return h; } };
-    H session{WinHttpOpen(L"Vetra/1.2", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, nullptr, nullptr, 0)};
+    H session{WinHttpOpen(userAgent ? userAgent : L"Vetra/1.2", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, nullptr, nullptr, 0)};
     if (!session) return {};
     WinHttpSetTimeouts(session, 3000, 3000, 4000, 4000);
     H host{WinHttpConnect(session, domain, INTERNET_DEFAULT_HTTPS_PORT, 0)};
@@ -198,14 +200,18 @@ Text httpGet(const wchar_t* domain, const Text& path, const Text& authHeader = {
     H req{WinHttpOpenRequest(host, L"GET", path.c_str(), nullptr, nullptr, nullptr, WINHTTP_FLAG_SECURE)};
     if (!req) return {};
     Text hdr = L"Accept: application/json, text/html\r\n";
-    if (!authHeader.empty()) hdr += authHeader + L"\r\n";
+    if (!extraHeaders.empty()) {
+        hdr += extraHeaders;
+        if (hdr.size() < 2 || hdr.compare(hdr.size() - 2, 2, L"\r\n") != 0) hdr += L"\r\n";
+    }
     if (!WinHttpSendRequest(req, hdr.c_str(), static_cast<DWORD>(hdr.size()), nullptr, 0, 0, 0) ||
         !WinHttpReceiveResponse(req, nullptr))
         return {};
     DWORD status = 0, sz = sizeof(status);
-    if (!WinHttpQueryHeaders(req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, nullptr, &status, &sz, nullptr) ||
-        status != 200)
+    if (!WinHttpQueryHeaders(req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, nullptr, &status, &sz, nullptr))
         return {};
+    if (outStatus) *outStatus = status;
+    if (status != 200) return {};
     std::string out;
     char buf[4096];
     DWORD rd = 0;
@@ -214,6 +220,10 @@ Text httpGet(const wchar_t* domain, const Text& path, const Text& authHeader = {
         out.append(buf, rd);
     } while (rd);
     return utf16(out);
+}
+
+Text httpGet(const wchar_t* domain, const Text& path, const Text& authHeader = {}, size_t maxBytes = 512 * 1024) {
+    return httpGetEx(domain, path, authHeader, maxBytes, L"Vetra/1.2", nullptr);
 }
 
 // ---------- 1. Live CPU Temperature via persistent PDH query (no elevation needed!) ----------
@@ -726,7 +736,235 @@ void readLocalCodex(AiPlanLive& out) {
     }
 }
 
-// ---------- 3. Local Claude Code Usage reader (exact per-message UTC timestamp + dedup, NO fake %) ----------
+// ---------- 3A. Local Claude Desktop plan-usage-history.json reader (mtime-cached, 5h & 7d live %) ----------
+fs::path findNewestClaudeDesktopUsageFile(fs::file_time_type& outMtime) {
+    std::error_code ec;
+    fs::path best;
+    fs::file_time_type bestMtime{};
+    auto consider = [&](const fs::path& candidate) {
+        if (!fs::is_regular_file(candidate, ec)) return;
+        const auto mt = fs::last_write_time(candidate, ec);
+        if (ec) return;
+        if (best.empty() || mt > bestMtime) {
+            best = candidate;
+            bestMtime = mt;
+        }
+    };
+    const Text roaming = envDir(L"APPDATA");
+    if (!roaming.empty())
+        consider(fs::path(roaming) / L"Claude" / L"plan-usage-history.json");
+    const Text local = envDir(L"LOCALAPPDATA");
+    if (!local.empty()) {
+        const fs::path pkgs = fs::path(local) / L"Packages";
+        if (fs::is_directory(pkgs, ec)) {
+            for (auto it = fs::directory_iterator(pkgs, fs::directory_options::skip_permission_denied, ec);
+                 !ec && it != fs::directory_iterator(); it.increment(ec)) {
+                if (!it->is_directory(ec)) continue;
+                const Text name = it->path().filename().wstring();
+                if (name.size() >= 7 && _wcsnicmp(name.c_str(), L"Claude_", 7) == 0)
+                    consider(it->path() / L"LocalCache" / L"Roaming" / L"Claude" / L"plan-usage-history.json");
+            }
+        }
+    }
+    if (!best.empty()) outMtime = bestMtime;
+    return best;
+}
+
+void readLocalClaudeDesktop(AiPlanLive& out) {
+    static std::mutex cacheMu;
+    static bool hasCached = false;
+    static fs::path cachedPath;
+    static fs::file_time_type cachedMtime{};
+    static uintmax_t cachedSize = 0;
+    static AiPlanLive cachedPlan{};
+
+    fs::file_time_type mtime{};
+    const fs::path path = findNewestClaudeDesktopUsageFile(mtime);
+    if (path.empty()) return;
+    std::error_code ec;
+    const auto fsz = fs::file_size(path, ec);
+    if (ec || fsz == 0 || fsz > 512 * 1024) return;
+
+    const time_t nowT = std::time(nullptr);
+    {
+        std::lock_guard lock(cacheMu);
+        if (hasCached && cachedPath == path && cachedMtime == mtime && cachedSize == fsz) {
+            if (cachedPlan.ready && (cachedPlan.updatedAt <= 0 || nowT - cachedPlan.updatedAt <= 7 * 86400))
+                out = cachedPlan;
+            return;
+        }
+    }
+
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return;
+    std::string raw(static_cast<size_t>(fsz), '\0');
+    f.read(raw.data(), static_cast<std::streamsize>(fsz));
+    if (raw.size() >= 3 && static_cast<unsigned char>(raw[0]) == 0xEF &&
+        static_cast<unsigned char>(raw[1]) == 0xBB && static_cast<unsigned char>(raw[2]) == 0xBF) {
+        raw.erase(0, 3);
+    }
+
+    AiPlanLive parsed{};
+    JsonObject root{nullptr};
+    if (JsonObject::TryParse(utf16(raw), root)) {
+        const auto samples = root.GetNamedArray(L"samples", nullptr);
+        if (samples && samples.Size() > 0) {
+            for (int i = static_cast<int>(samples.Size()) - 1; i >= 0; --i) {
+                const auto item = samples.GetAt(static_cast<uint32_t>(i));
+                if (!item || item.ValueType() != JsonValueType::Object) continue;
+                const auto sample = item.GetObject();
+                JsonObject u{nullptr};
+                if (!getJsonObject(sample, L"u", u)) continue;
+                double fh = getJsonNum(u, L"fh", -1.0);
+                if (fh < 0.0) fh = getJsonNum(u, L"five_hour", -1.0);
+                double sd = getJsonNum(u, L"sd", -1.0);
+                if (sd < 0.0) sd = getJsonNum(u, L"seven_day", -1.0);
+                if (fh < 0.0 && sd < 0.0) continue;
+
+                const time_t sampleT = parseJsonTime(sample, L"t");
+                if (sampleT > 0 && nowT - sampleT > 7 * 86400) break;
+
+                if (fh >= 0.0) parsed.p1 = std::clamp(100 - static_cast<int>(std::lround(fh)), 0, 100);
+                if (sd >= 0.0) parsed.p2 = std::clamp(100 - static_cast<int>(std::lround(sd)), 0, 100);
+                parsed.r1At = parseJsonTime(u, L"fhr");
+                if (parsed.r1At <= 0) parsed.r1At = parseJsonTime(u, L"five_hour_resets_at");
+                parsed.r2At = parseJsonTime(u, L"sdr");
+                if (parsed.r2At <= 0) parsed.r2At = parseJsonTime(u, L"seven_day_resets_at");
+                parsed.r1WinMins = 300;
+                parsed.r2WinMins = 10080;
+                parsed.updatedAt = sampleT > 0 ? sampleT : fileTimeToEpoch(mtime);
+                parsed.ready = true;
+                parsed.hasLimits = (parsed.p1 >= 0 || parsed.p2 >= 0);
+                parsed.sourceLabel = L"Claude Desktop";
+                break;
+            }
+        }
+    }
+
+    {
+        std::lock_guard lock(cacheMu);
+        hasCached = true;
+        cachedPath = path;
+        cachedMtime = mtime;
+        cachedSize = fsz;
+        cachedPlan = parsed;
+    }
+    if (parsed.ready) out = std::move(parsed);
+}
+
+// ---------- 3B. Live Claude Code OAuth usage API (api.anthropic.com/api/oauth/usage, polite rate-limit handling) ----------
+bool parseClaudeOAuthWindow(const JsonObject& root, const wchar_t* key, int& pctLeft, time_t& resetsAt, int winMins) {
+    JsonObject w{nullptr};
+    if (!getJsonObject(root, key, w)) return false;
+    const double used = getJsonNum(w, L"utilization", -1.0);
+    if (used < 0.0 || !std::isfinite(used)) return false;
+    pctLeft = std::clamp(100 - static_cast<int>(std::lround(used)), 0, 100);
+    resetsAt = parseJsonTime(w, L"resets_at");
+    const time_t nowT = std::time(nullptr);
+    if (resetsAt > 0 && resetsAt <= nowT) {
+        pctLeft = 100;
+        resetsAt = 0;
+    }
+    (void)winMins;
+    return true;
+}
+
+AiPlanLive fetchClaudeOAuthUsage(std::shared_ptr<std::atomic<bool>> stop) {
+    static std::mutex apiMu;
+    static ULONGLONG cooldownUntil = 0;
+    static bool hasRejectedMtime = false;
+    static fs::file_time_type rejectedMtime{};
+
+    AiPlanLive out;
+    if (stop && stop->load()) return out;
+    const Text home = userProfileDir();
+    if (home.empty()) return out;
+    const fs::path credPath = fs::path(home) / L".claude" / L".credentials.json";
+    std::error_code ec;
+    if (!fs::is_regular_file(credPath, ec)) return out;
+    const auto mtime = fs::last_write_time(credPath, ec);
+    if (ec) return out;
+
+    const ULONGLONG nowTick = GetTickCount64();
+    {
+        std::lock_guard lock(apiMu);
+        if (hasRejectedMtime && rejectedMtime == mtime) return out;
+        if (cooldownUntil && nowTick < cooldownUntil) return out;
+        cooldownUntil = nowTick + 30000ULL; // minimum 30s spacing even on manual refresh
+    }
+
+    auto markRejected = [&]() {
+        std::lock_guard lock(apiMu);
+        hasRejectedMtime = true;
+        rejectedMtime = mtime;
+    };
+
+    std::ifstream f(credPath, std::ios::binary);
+    if (!f) return out;
+    std::string raw((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    if (raw.empty() || raw.size() > 256 * 1024) { markRejected(); return out; }
+    JsonObject root{nullptr}, oauth{nullptr};
+    if (!JsonObject::TryParse(utf16(raw), root) ||
+        (!getJsonObject(root, L"claudeAiOauth", oauth) && !getJsonObject(root, L"claudeAi", oauth))) {
+        markRejected();
+        return out;
+    }
+    Text token = getJsonStr(oauth, L"accessToken");
+    if (token.empty()) { markRejected(); return out; }
+    const time_t expiresAt = parseJsonTime(oauth, L"expiresAt");
+    const time_t nowT = std::time(nullptr);
+    if (expiresAt > 0 && expiresAt <= nowT + 30) {
+        SecureZeroMemory(token.data(), token.size() * sizeof(wchar_t));
+        markRejected();
+        return out;
+    }
+
+    Text hdrs = L"Authorization: Bearer " + token + L"\r\nanthropic-beta: oauth-2025-04-20\r\n";
+    SecureZeroMemory(token.data(), token.size() * sizeof(wchar_t));
+
+    DWORD status = 0;
+    const Text body = httpGetEx(L"api.anthropic.com", L"/api/oauth/usage", hdrs, 128 * 1024, L"claude-code/2.1.332", &status);
+    SecureZeroMemory(hdrs.data(), hdrs.size() * sizeof(wchar_t));
+
+    if (status == 429) {
+        std::lock_guard lock(apiMu);
+        cooldownUntil = GetTickCount64() + 600000ULL; // 10 min backoff on rate limit
+        return out;
+    }
+    if (status == 401 || status == 403) {
+        markRejected();
+        return out;
+    }
+    if (status != 200 || body.empty()) return out;
+
+    JsonObject resp{nullptr};
+    if (!JsonObject::TryParse(body, resp)) return out;
+    const bool got1 = parseClaudeOAuthWindow(resp, L"five_hour", out.p1, out.r1At, 300);
+    const bool got2 = parseClaudeOAuthWindow(resp, L"seven_day", out.p2, out.r2At, 10080);
+    if (got1 || got2) {
+        out.r1WinMins = 300;
+        out.r2WinMins = 10080;
+        out.ready = true;
+        out.hasLimits = true;
+        out.sourceLabel = L"Claude canlı (OAuth)";
+        out.updatedAt = std::time(nullptr);
+    }
+    return out;
+}
+
+void mergeClaudeTokens(AiPlanLive& dst, const AiPlanLive& src) {
+    if (src.hasTokens) {
+        dst.hasTokens = true;
+        if (src.sessionTokens >= 0) dst.sessionTokens = src.sessionTokens;
+        if (src.weeklyTokens >= 0) dst.weeklyTokens = src.weeklyTokens;
+    }
+    if (!src.modelName.empty()) {
+        dst.modelName = src.modelName;
+        dst.modelTokens = src.modelTokens;
+    }
+}
+
+// ---------- 3C. Local Claude Code Usage reader (exact per-message UTC timestamp + dedup, NO fake %) ----------
 void readLocalClaude(AiPlanLive& out) {
     const Text home = userProfileDir();
     if (home.empty()) return;
@@ -1650,10 +1888,11 @@ void Dock::drawProWidget(View& view, int id, Box b, Palette p, bool preview, boo
         }
     };
 
-    if (id == AiLimitsTriple || (id == AiLimits &&
+    const bool showTriple = id == AiLimitsTriple || (id == AiLimits && !preview && model.aiLimitTriple);
+    if (showTriple || (id == AiLimits &&
         model.aiLimitFirst < std::ssize(OverviewNames) && model.aiLimitSecond < std::ssize(OverviewNames))) {
         const std::array pair{model.aiLimitFirst, model.aiLimitSecond};
-        const bool triple = id == AiLimitsTriple;
+        const bool triple = showTriple;
         const std::span<const int> plans = triple ? std::span<const int>(OverviewPlans) : std::span<const int>(pair);
         const float colW = 60.f;
         const float colGap = 10.f;
@@ -1984,8 +2223,8 @@ void Dock::sampleProWidgets(bool forceWeb) {
     const auto stamp = GetTickCount64();
     const auto active = [&](int id) { return page == id || (shown(id) && !isFoldedWidget(id)); };
 
-    const bool triple = active(AiLimitsTriple);
     const bool aiLimits = active(AiLimits);
+    const bool triple = active(AiLimitsTriple) || (aiLimits && model.aiLimitTriple);
     const auto aiPlanShown = [&](int idx) {
         if (aiLimits && (model.aiLimitFirst == idx || model.aiLimitSecond == idx)) return true;
         if (triple && (idx == 0 || idx == 1 || idx == 2)) return true;
@@ -2008,6 +2247,7 @@ void Dock::sampleProWidgets(bool forceWeb) {
     if (needLocal && !extra.proLocalRequest.valid() && (forceWeb || !extra.proLocalAt || stamp >= extra.proLocalAt)) {
         extra.proLocalAt = stamp + 5000;
         if (doDeepScan && aiAny) lastDeepScanAt = stamp;
+        const bool scanClaudeDesktop = needClaude;
         const bool scanClaude   = doDeepScan && needClaude;
         const bool scanCodex    = doDeepScan && needCodex && !(extra.aiLive[1].ready && !extra.aiLive[1].fromFeedFile && !forceWeb);
         const bool scanGemini   = doDeepScan && needGemini && !extra.antigravityLive.ready;
@@ -2017,12 +2257,18 @@ void Dock::sampleProWidgets(bool forceWeb) {
         const auto stop = extra.proStop;
         try {
             extra.proLocalRequest = std::async(std::launch::async,
-                [needTemp, needCpuPdh, scanClaude, scanCodex, scanGemini, scanOpenCode, scanFeed, notify, stop]() {
+                [needTemp, needCpuPdh, scanClaudeDesktop, scanClaude, scanCodex, scanGemini, scanOpenCode, scanFeed, notify, stop]() {
                 winrt::init_apartment();
                 ProLocalSnapshot snap;
                 if (needCpuPdh) sharedPdhCpu().primeAsync();
                 if (needTemp) snap.cpuTempC = readCpuTempC();
-                if (scanClaude)   readLocalClaude(snap.ai[0]);
+                if (scanClaudeDesktop) readLocalClaudeDesktop(snap.ai[0]);
+                if (scanClaude) {
+                    AiPlanLive tokSnap;
+                    readLocalClaude(tokSnap);
+                    if (snap.ai[0].hasLimits) mergeClaudeTokens(snap.ai[0], tokSnap);
+                    else if (tokSnap.ready) snap.ai[0] = std::move(tokSnap);
+                }
                 if (scanCodex)    readLocalCodex(snap.ai[1]);
                 if (scanGemini)   readLocalGemini(snap.ai[2]);
                 if (scanOpenCode) readLocalOpenCode(snap.ai[7]);
@@ -2034,17 +2280,38 @@ void Dock::sampleProWidgets(bool forceWeb) {
         } catch (const std::exception&) {}
     }
 
+    // Live Claude Code OAuth usage API refresh (every 5 min when visible, skips immediately if no valid OAuth token)
+    const bool needClaudeLive = forceWeb || triple || active(ClaudeUsage) || active(ClaudePlanUsage) ||
+        (aiLimits && (model.aiLimitFirst == 0 || model.aiLimitSecond == 0));
+    if (needClaudeLive && !extra.aiLive[0].fromFeedFile && !extra.claudeLiveRequest.valid() &&
+        (forceWeb || !extra.claudeLiveAt || stamp >= extra.claudeLiveAt)) {
+        extra.claudeLiveAt = stamp + 300000;
+        const HWND notify = hwnd;
+        auto stop = extra.proStop;
+        try {
+            extra.claudeLiveRequest = std::async(std::launch::async, [stop, notify]() {
+                winrt::init_apartment();
+                auto res = fetchClaudeOAuthUsage(stop);
+                winrt::uninit_apartment();
+                if (notify && (!stop || !stop->load())) PostMessageW(notify, AsyncWake, 0, 0);
+                return res;
+            });
+        } catch (const std::exception&) {}
+    }
+
     // Official Codex app-server live rate-limit refresh (every 60s when visible, or immediately on Yenile)
     const bool needCodexLive = forceWeb || triple || active(ChatGptUsage) ||
         (aiLimits && (model.aiLimitFirst == 1 || model.aiLimitSecond == 1));
     if (needCodexLive && !extra.codexLiveRequest.valid() && (forceWeb || !extra.codexLiveAt || stamp >= extra.codexLiveAt)) {
         extra.codexLiveAt = stamp + 60000;
+        const HWND notify = hwnd;
         auto stop = extra.proStop;
         try {
-            extra.codexLiveRequest = std::async(std::launch::async, [stop]() {
+            extra.codexLiveRequest = std::async(std::launch::async, [stop, notify]() {
                 winrt::init_apartment();
                 auto res = fetchCodexAppServer(stop);
                 winrt::uninit_apartment();
+                if (notify && (!stop || !stop->load())) PostMessageW(notify, AsyncWake, 0, 0);
                 return res;
             });
         } catch (const std::exception&) {}
@@ -2055,12 +2322,14 @@ void Dock::sampleProWidgets(bool forceWeb) {
     if (needAntigravity && !extra.aiLive[2].fromFeedFile && !extra.antigravityRequest.valid() &&
         (forceWeb || stamp >= extra.antigravityAt)) {
         extra.antigravityAt = stamp + 60000;
+        const HWND notify = hwnd;
         auto stop = extra.proStop;
         try {
-            extra.antigravityRequest = std::async(std::launch::async, [stop]() {
+            extra.antigravityRequest = std::async(std::launch::async, [stop, notify]() {
                 winrt::init_apartment();
                 auto live = fetchAntigravityUsage(*stop);
                 winrt::uninit_apartment();
+                if (notify && (!stop || !stop->load())) PostMessageW(notify, AsyncWake, 0, 0);
                 return live;
             });
         } catch (const std::exception&) {}
@@ -2111,6 +2380,18 @@ bool Dock::tickProWidgets(ULONGLONG) {
         if (!extra.aiLive[2].fromFeedFile && planLiveChanged(extra.antigravityLive, live)) dirty = true;
         if (!extra.aiLive[2].fromFeedFile) extra.antigravityLive = std::move(live);
     }
+    if (extra.claudeLiveRequest.valid() && extra.claudeLiveRequest.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+        try {
+            auto live = extra.claudeLiveRequest.get();
+            if (live.ready && !extra.aiLive[0].fromFeedFile) {
+                mergeClaudeTokens(live, extra.aiLive[0]);
+                if (!extra.aiLive[0].hasLimits || live.updatedAt >= extra.aiLive[0].updatedAt) {
+                    if (planLiveChanged(extra.aiLive[0], live)) dirty = true;
+                    extra.aiLive[0] = std::move(live);
+                }
+            }
+        } catch (const std::exception&) {}
+    }
     if (extra.codexLiveRequest.valid() && extra.codexLiveRequest.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
         try {
             auto live = extra.codexLiveRequest.get();
@@ -2132,6 +2413,29 @@ bool Dock::tickProWidgets(ULONGLONG) {
                 if (!snap.ai[i].ready) {
                     if (extra.aiLive[i].fromFeedFile) { extra.aiLive[i] = {}; dirty = true; }
                     continue;
+                }
+                if (i == 0 && !snap.ai[0].fromFeedFile && extra.aiLive[0].ready && !extra.aiLive[0].fromFeedFile) {
+                    if (!snap.ai[0].hasLimits && extra.aiLive[0].hasLimits) {
+                        AiPlanLive merged = extra.aiLive[0];
+                        mergeClaudeTokens(merged, snap.ai[0]);
+                        if (planLiveChanged(extra.aiLive[0], merged)) {
+                            extra.aiLive[0] = std::move(merged);
+                            dirty = true;
+                        }
+                        continue;
+                    }
+                    if (!snap.ai[0].hasTokens && extra.aiLive[0].hasTokens)
+                        mergeClaudeTokens(snap.ai[0], extra.aiLive[0]);
+                    if (extra.aiLive[0].hasLimits && extra.aiLive[0].r1At > 0 && snap.ai[0].r1At == 0 &&
+                        extra.aiLive[0].updatedAt >= snap.ai[0].updatedAt) {
+                        AiPlanLive merged = extra.aiLive[0];
+                        mergeClaudeTokens(merged, snap.ai[0]);
+                        if (planLiveChanged(extra.aiLive[0], merged)) {
+                            extra.aiLive[0] = std::move(merged);
+                            dirty = true;
+                        }
+                        continue;
+                    }
                 }
                 // Don't let an older local .codex/sessions JSONL overwrite a fresher codex app-server live snapshot
                 if (i == 1 && !snap.ai[1].fromFeedFile && extra.aiLive[1].ready && !extra.aiLive[1].fromFeedFile &&
@@ -2194,8 +2498,11 @@ void Dock::editProWidget(int id) {
             if (fields[0].value == AiPlanNames[i]) model.aiLimitFirst = i;
             if (fields[1].value == AiPlanNames[i]) model.aiLimitSecond = i;
         }
+        model.aiLimitTriple = false;
         extra.proLocalAt = 0;
+        extra.claudeLiveAt = 0;
         extra.codexLiveAt = 0;
+        extra.antigravityAt = 0;
         sampleProWidgets(true);
         changed(false);
         return;
@@ -2314,6 +2621,7 @@ void Dock::editProWidget(int id) {
     if (action == 2) {
         ov = {};
         extra.proLocalAt = 0;
+        extra.claudeLiveAt = 0;
         extra.codexLiveAt = 0;
         sampleProWidgets(true);
         changed(false);
@@ -2348,31 +2656,50 @@ void Dock::proPanel(Palette p) {
     drawProWidget(sheet, id, box((sheet.w - cardW) / 2.f, 104, cardW, Design::CardHeight), p, false, false);
 
     if (id == AiLimits || id == AiLimitsTriple) {
-        const bool triple = id == AiLimitsTriple;
+        const bool tripleWidget = id == AiLimitsTriple;
+        const bool triple = tripleWidget || model.aiLimitTriple;
         const std::array currentPair{model.aiLimitFirst, model.aiLimitSecond};
         const std::span<const int> plans = triple ? std::span<const int>(OverviewPlans) : std::span<const int>(currentPair);
-        if (!triple) {
-            float y = 178.f;
+        if (!tripleWidget) {
+            float y = 174.f;
+            const Text allLabel = Text(OverviewNames[0]) + L" + " + OverviewNames[1] + L" + " + OverviewNames[2];
+            button(sheet, p, box(29, y, 380, 36), model.aiLimitTriple ? L"✓  " + allLabel : allLabel, [this] {
+                if (model.aiLimitTriple) return;
+                model.aiLimitTriple = true;
+                extra.proLocalAt = 0;
+                extra.claudeLiveAt = 0;
+                extra.codexLiveAt = 0;
+                extra.antigravityAt = 0;
+                sampleProWidgets(true);
+                changed(false);
+            }, model.aiLimitTriple);
+            y += 42.f;
             for (const auto& pair : PlanPairs) {
                 const auto [first, second] = pair;
-                const bool selected = (model.aiLimitFirst == first && model.aiLimitSecond == second) ||
-                    (model.aiLimitFirst == second && model.aiLimitSecond == first);
+                const bool selected = !model.aiLimitTriple &&
+                    ((model.aiLimitFirst == first && model.aiLimitSecond == second) ||
+                     (model.aiLimitFirst == second && model.aiLimitSecond == first));
                 const Text label = Text(OverviewNames[first]) + L" + " + OverviewNames[second];
-                button(sheet, p, box(29, y, 380, 38), selected ? L"✓  " + label : label, [this, first, second, selected] {
+                button(sheet, p, box(29, y, 380, 36), selected ? L"✓  " + label : label, [this, first, second, selected] {
                     if (selected) return;
+                    model.aiLimitTriple = false;
                     model.aiLimitFirst = first;
                     model.aiLimitSecond = second;
+                    extra.proLocalAt = 0;
+                    extra.claudeLiveAt = 0;
+                    extra.codexLiveAt = 0;
+                    extra.antigravityAt = 0;
                     sampleProWidgets(true);
                     changed(false);
                 }, selected);
-                y += 45.f;
+                y += 42.f;
             }
-            button(sheet, p, box(29, 438, 210, 34), L"Diğer planlar", [this] { editProWidget(AiLimits); });
+            button(sheet, p, box(29, 490, 210, 34), L"Diğer planlar", [this] { editProWidget(AiLimits); });
         }
         const bool overview = triple || (currentPair[0] < std::ssize(OverviewNames) && currentPair[1] < std::ssize(OverviewNames));
         if (overview) {
-            const float top = triple ? 178.f : 315.f;
-            p.card(d, box(29, top, 380, triple ? 134.f : 105.f), 14);
+            const float top = tripleWidget ? 178.f : 348.f;
+            p.card(d, box(29, top, 380, triple ? 128.f : 100.f), 14);
             d.text(L"Sıfırlanmaya kalan", box(45, top + 7, 178, 24), Caption, tint(p.muted));
             d.text(L"5h", box(226, top + 7, 72, 24), Caption, tint(p.muted), Right);
             d.text(L"Weekly", box(309, top + 7, 84, 24), Caption, tint(p.muted), Right);
@@ -2386,7 +2713,11 @@ void Dock::proPanel(Palette p) {
                 y += 28;
             }
         }
-        button(sheet, p, box(249, triple ? 338.f : 438.f, 160, 34), L"Şimdi yenile", [this] {
+        button(sheet, p, box(249, tripleWidget ? 338.f : 490.f, 160, 34), L"Şimdi yenile", [this] {
+            extra.proLocalAt = 0;
+            extra.claudeLiveAt = 0;
+            extra.codexLiveAt = 0;
+            extra.antigravityAt = 0;
             sampleProWidgets(true);
             paintSheet();
         });
@@ -2450,21 +2781,28 @@ void Dock::proPanel(Palette p) {
                 detailLine2 = L"üzerinden otomatik okunur.";
             }
         } else if (id == ClaudeUsage || id == ClaudePlanUsage) {
-            if (pd.fromFeedFile && (pd.p1 >= 0 || pd.p2 >= 0)) {
-                const Text l1 = pd.l1.empty() ? L"Session" : pd.l1;
-                const Text l2 = pd.l2.empty() ? L"Weekly" : pd.l2;
+            if (pd.p1 >= 0 || pd.p2 >= 0) {
+                const Text l1 = pd.l1.empty() ? L"5 saatlik" : pd.l1;
+                const Text l2 = pd.l2.empty() ? L"Haftalık" : pd.l2;
+                const Text r1Clk = formatResetClock(pd.r1At);
+                const Text r2Clk = formatResetClock(pd.r2At);
                 infoLine = l1 + L": " + (pd.p1 >= 0 ? (num(pd.p1) + L"% kalan") : L"—") +
                            L"  ·  " + l2 + L": " + (pd.p2 >= 0 ? (num(pd.p2) + L"% kalan") : L"—");
-                detailLine = L"%LOCALAPPDATA%\\Vetra\\ai_usage.json izleniyor (5 sn).";
-                detailLine2 = L"Geri sayım ve dolan pencereler her dakika güncellenir.";
+                detailLine = !r1Clk.empty() ? (l1 + L" sıfırlanma: " + r1Clk + L" (" + pd.r1 + L")")
+                           : !r2Clk.empty() ? (l2 + L" sıfırlanma: " + r2Clk + L" (" + pd.r2 + L")")
+                           : pd.fromFeedFile ? L"%LOCALAPPDATA%\\Vetra\\ai_usage.json izleniyor (5 sn)."
+                           : L"Claude Desktop ve OAuth limitleri otomatik yenilenir.";
+                detailLine2 = (!r1Clk.empty() && !r2Clk.empty())
+                    ? (l2 + L" sıfırlanma: " + r2Clk + L" (" + pd.r2 + L")")
+                    : L"Dock limitleri otomatik günceller.";
             } else {
                 infoLine = pd.hasTokens
                     ? (L"Claude Code · Son 5s: " + formatCompact(pd.sessionTok) + L" · Son 7g: " + formatCompact(pd.weeklyTok))
-                    : L"Yerel Claude Code oturumu bulunamadı";
-                detailLine = L"Canlı % için %LOCALAPPDATA%\\Vetra\\ai_usage.json yaz.";
-                detailLine2 = L"Yerel token kayıtları 5 sn’de bir otomatik yenilenir.";
+                    : L"Claude kullanım verisi bekleniyor…";
+                detailLine = L"Claude Desktop, Claude Code OAuth veya ai_usage.json okunur.";
+                detailLine2 = L"Yerel dosyalar 5 sn’de bir otomatik yenilenir.";
             }
-            metaLine = (live.sourceLabel.empty() ? L"Kaynak: ~/.claude/projects" : L"Kaynak: " + live.sourceLabel) +
+            metaLine = (live.sourceLabel.empty() ? L"Kaynak: Claude" : L"Kaynak: " + live.sourceLabel) +
                        (updated.empty() ? L"" : L" · " + updated);
         } else if (id == GeminiUsage) {
             if (live.hasLimits && (pd.p1 >= 0 || pd.p2 >= 0)) {
@@ -2549,13 +2887,13 @@ void Dock::proPanel(Palette p) {
         button(sheet, p, box(29, 338, 210, 34), L"Değerleri düzenle",
             [this, id] { editProWidget(id); }, true);
         button(sheet, p, box(249, 338, 160, 34), L"Şimdi yenile", [this] {
-            extra.proLocalAt = 0; extra.codexLiveAt = 0; extra.proWebAt = 0; sampleProWidgets(true); paintSheet();
+            extra.proLocalAt = 0; extra.claudeLiveAt = 0; extra.codexLiveAt = 0; extra.proWebAt = 0; sampleProWidgets(true); paintSheet();
         });
     } else {
         button(sheet, p, box(29, 338, 142, 34), L"Değer düzenle", [this, id] { editProWidget(id); }, true);
         button(sheet, p, box(179, 338, 126, 34), L"JSON dosyası", [this] { openAiFeedInExplorer(panel ? panel : hwnd); });
         button(sheet, p, box(313, 338, 96, 34), L"Yenile", [this] {
-            extra.proLocalAt = 0; extra.codexLiveAt = 0; extra.proWebAt = 0; sampleProWidgets(true); paintSheet();
+            extra.proLocalAt = 0; extra.claudeLiveAt = 0; extra.codexLiveAt = 0; extra.proWebAt = 0; sampleProWidgets(true); paintSheet();
         });
     }
 }

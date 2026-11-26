@@ -15,6 +15,7 @@ struct TrayItem {
     HWND targetHwnd{};
     UINT uid = 0;
     UINT callbackMsg = 0;
+    bool onTaskbar = false;
 };
 std::unique_ptr<Gdiplus::Bitmap> normalizeAppIcon(Gdiplus::Bitmap& src);
 std::unique_ptr<Gdiplus::Bitmap> highResIconForPath(const wchar_t* path);
@@ -225,6 +226,11 @@ struct SessionTimer {
     bool update(ULONGLONG stamp);
     void reset(int minutes);
 };
+struct MicrophoneState {
+    int mute = -1;
+    Text deviceName;
+    std::vector<Text> activeApps;
+};
 struct ExtraWidgets {
     struct ExchangeRate { int from = -1, to = -1; double rate = 0; Text date; };
     std::future<ExchangeRate> exchangeRequest;
@@ -235,6 +241,9 @@ struct ExtraWidgets {
     int microphoneMute = -1;
     Text micDeviceName;
     std::vector<Text> micActiveApps;
+    std::future<MicrophoneState> micRequest;
+    ULONGLONG lastMicPollAt = 0;
+    bool micToggleQueued = false, micRefreshQueued = false;
     std::vector<AudioEndpointInfo> micDevices;
     std::vector<KeyboardLayoutInfo> keyboardLayouts;
     HKL activeKeyboardHkl{};
@@ -308,11 +317,12 @@ struct ExtraWidgets {
     long long xFollowersLive = -1;
     std::future<ProLocalSnapshot> proLocalRequest;
     std::future<ProWebSnapshot> proWebRequest;
+    std::future<AiPlanLive> claudeLiveRequest;
     std::future<AiPlanLive> codexLiveRequest;
     std::future<AiPlanLive> antigravityRequest;
     AiPlanLive antigravityLive;
     ULONGLONG antigravityAt = 0;
-    ULONGLONG proLocalAt = 0, proWebAt = 0, codexLiveAt = 0;
+    ULONGLONG proLocalAt = 0, proWebAt = 0, claudeLiveAt = 0, codexLiveAt = 0;
     std::shared_ptr<std::atomic<bool>> proStop = std::make_shared<std::atomic<bool>>(false);
     ULONGLONG elapsed(ULONGLONG stamp) const { return watchAccum + (watchStart ? stamp - watchStart : 0); }
 };

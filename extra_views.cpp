@@ -83,284 +83,145 @@ void Dock::drawQuickToggles(View& view, Box b, Palette p, bool preview, bool lab
 }
 
 float Dock::statusBarWidth() const {
-    const auto& sb = model.statusBar;
-    if (!sb.enabled) return 0.f;
-    const bool showMic = sb.microphone && (!sb.micOnlyInUse || !extra.micActiveApps.empty() || extra.microphoneMute == 1);
-    const bool showKey = sb.keyboard;
-    const bool showNet = sb.network;
-    const bool showVol = sb.volume;
-    const bool showBat = sb.battery && battery >= 0;
-    const bool showClock = sb.clock;
-    const bool showBell = sb.notifications;
-    const bool hasInput = showMic || showKey;
-    const bool hasQuick = showNet || showVol || showBat;
-    const bool hasTime = showClock || showBell;
-    if (!hasInput && !hasQuick && !hasTime) return 0.f;
-
-    float w = 12.f; // 6px horizontal padding on both ends
-    bool anyBefore = false;
-    auto addGroup = [&](float groupW) {
-        if (groupW <= 0.f) return;
-        if (anyBefore) w += 9.f; // divider spacing
-        w += groupW;
-        anyBefore = true;
-    };
-    float inputW = 0.f;
-    if (showMic) inputW += 30.f;
-    if (showKey) inputW += (inputW > 0.f ? 2.f : 0.f) + 34.f;
-    addGroup(inputW);
-
-    float quickW = 0.f;
-    if (showNet) quickW += 32.f;
-    if (showVol) quickW += (quickW > 0.f ? 2.f : 0.f) + 32.f;
-    if (showBat) quickW += (quickW > 0.f ? 2.f : 0.f) + 32.f;
-    addGroup(quickW);
-
-    float timeW = 0.f;
-    if (showClock) timeW += 68.f;
-    if (showBell) timeW += (timeW > 0.f ? 2.f : 0.f) + 26.f;
-    addGroup(timeW);
-    return w;
+    float result = 0.f;
+    for (int id = StatusMic; id <= StatusNotifications; ++id)
+        if (shown(id)) result += widgetWidth(id);
+    return result;
 }
 
-float Dock::trailingWidth() const {
-    const float sb = statusBarWidth();
-    return Design::TrayWidth + (sb > 0.f ? Design::StatusBarGap + sb : 0.f) +
-        Design::DesktopStripGap + Design::DesktopStripWidth;
+static int dockControlPage(int id) {
+    switch (id) {
+    case HiddenTrayControl: return SystemTray;
+    case StatusMic: return MicControl;
+    case StatusKeyboard: return KeyboardLang;
+    case StatusNetwork: return NetworkPanel;
+    case StatusVolume: return Volume;
+    case StatusBattery: return Power;
+    case StatusClock:
+    case StatusNotifications: return NotificationCenter;
+    default: return -1;
+    }
 }
 
-void Dock::drawStatusBar(View& view, float x, Palette p) {
-    const float totalW = statusBarWidth();
-    if (totalW <= 0.f) return;
+void Dock::activateDockControl(int id, float anchor) {
+    if (id == HiddenTrayControl) showSystemTray(anchor);
+    else if (id == DesktopStripControl) toggleDesktop();
+    else if (const int destination = dockControlPage(id); destination >= 0) open(destination, anchor);
+}
+
+void Dock::drawDockControl(View& view, int id, Box b, Palette p, bool preview) {
     auto& d = view.d;
-    const bool isPrimary = &view == &bar;
-    const auto& sb = model.statusBar;
-    const Box card = d.snap(box(x, Design::DockInset, totalW, Design::CardHeight));
-
-    if (p.glass) {
-        const float tone = p.opacity / 100.f;
-        const float fillAlpha = p.theme == LiquidGlass ? (.20f + tone * .24f) : .28f;
-        d.fill(card, Design::Radius, tint(p.theme == LiquidGlass ? 0x08090B : p.base, fillAlpha));
-        d.glassRim(card, Design::Radius, .28f);
-    } else if (p.theme == BareTheme) {
-        p.card(d, card, Design::Radius);
-    } else {
-        d.fill(card, Design::Radius, tint(p.high, .88f));
-        d.outline(box(card.left + .5f, card.top + .5f, width(card) - 1.f, height(card) - 1.f),
-            Design::Radius - .5f, tint(p.line, p.light ? .22f : .20f), 1.f);
+    const float centerX = (b.left + b.right) / 2.f;
+    const float centerY = (b.top + b.bottom) / 2.f;
+    const bool active = !preview && &view == &bar && panel && !sheetClosing && page == dockControlPage(id);
+    const bool editing = !preview && dockEditMode;
+    if (!preview) {
+        std::function<void()> secondary;
+        if (!editing) {
+            switch (id) {
+            case StatusMic: secondary = [this] { sampleMicrophone(true); }; break;
+            case StatusKeyboard: secondary = [this] { cycleKeyboardLayout(1); }; break;
+            case StatusNetwork: secondary = [this] { launch(L"ms-settings:network-status"); }; break;
+            case StatusVolume: secondary = [this] { changeVolume(0, true); }; break;
+            case StatusBattery: secondary = [this] { launch(L"ms-settings:powersleep"); }; break;
+            case StatusClock: secondary = [this] { launch(L"ms-settings:dateandtime"); }; break;
+            case StatusNotifications: secondary = [this] { launch(L"ms-settings:notifications"); }; break;
+            }
+        }
+        hit(view, b, [this, id, centerX, editing] {
+            if (!editing) activateDockControl(id, centerX);
+        }, std::move(secondary));
+        view.hits.back().order = {OrderKind::Widget, id};
+        if (!editing && &view == &bar) {
+            if (id == StatusKeyboard) statusKeyboardHit = b;
+            if (id == StatusVolume) statusVolumeHit = b;
+        }
     }
+    const float hot = preview ? 0.f : view.hoverAmount();
+    const float down = preview ? 0.f : view.pressAmount();
+    // The dock surface is the background for these indicators. Only their
+    // foreground tint and press offset change in response to input.
+    const unsigned ink = mixRgb(p.ink, p.accent, active ? .75f : .36f * hot);
 
-    const bool showMic = sb.microphone && (!sb.micOnlyInUse || !extra.micActiveApps.empty() || extra.microphoneMute == 1);
-    const bool showKey = sb.keyboard;
-    const bool showNet = sb.network;
-    const bool showVol = sb.volume;
-    const bool showBat = sb.battery && battery >= 0;
-    const bool showClock = sb.clock;
-    const bool showBell = sb.notifications;
-
-    const float itemTop = card.top + 7.f;
-    const float itemH = Design::CardHeight - 14.f;
-    float cx = card.left + 6.f;
-    bool prevGroup = false;
-
-    const auto drawDivider = [&]() {
-        d.line(cx + 4.5f, card.top + 15.f, cx + 4.5f, card.bottom - 15.f, tint(p.ink, .16f), 1.f);
-        cx += 9.f;
+    const auto icon = [&](Glyph glyph, float size, Color color) {
+        d.icon(glyph, d.snap(box(centerX - size / 2, centerY - size / 2 + down, size, size)), color);
     };
-    const auto drawPillBg = [&](Box b, float hot, bool active) {
-        if (!active && hot <= 0.01f) return;
-        const float a = active ? (p.glass ? .14f : .13f) : (p.glass ? .09f : .10f) * hot;
-        d.fill(b, 10.f, tint(active ? p.accent : (p.light ? 0x10141A : 0xFFFFFF), a));
-        if (active) d.outline(box(b.left + .5f, b.top + .5f, width(b) - 1.f, height(b) - 1.f), 9.5f, tint(p.accent, .45f), .9f);
-    };
-
-    // Group 1: Microphone + Keyboard Language
-    if (showMic || showKey) {
-        if (showMic) {
-            const Box slot = box(cx, itemTop, 30.f, itemH);
-            const bool active = isPrimary && panel && !sheetClosing && page == MicControl;
-            hit(view, slot, [this, mid = (slot.left + slot.right) / 2.f] { open(MicControl, mid); },
-                [this] { sampleMicrophone(true); });
-            const float hot = view.hoverAmount();
-            const float down = view.pressAmount();
-            drawPillBg(slot, hot, active);
-            const bool inUse = !extra.micActiveApps.empty() && extra.microphoneMute != 1;
-            const bool muted = extra.microphoneMute == 1;
-            const unsigned micCol = muted ? Design::focusRed(p.light)
-                : inUse ? (p.light ? 0x078D82 : 0x45E5D8)
-                : p.ink;
-            D2D1::Matrix3x2F prev{};
-            if (down > 0.005f) {
-                d.target->GetTransform(&prev);
-                const float s = 1.f - 0.07f * down;
-                d.target->SetTransform(D2D1::Matrix3x2F::Scale(s, s, {slot.left + 15.f, slot.top + itemH / 2.f}) * prev);
-            }
-            const Box iconBox = box(slot.left + 6.f, slot.top + (itemH - 18.f) / 2.f, 18.f, 18.f);
-            d.icon(MicIcon, iconBox, tint(micCol, extra.microphoneMute < 0 ? .45f : .95f));
-            if (muted) d.line(iconBox.left + 2.5f, iconBox.bottom - 2.5f, iconBox.right - 2.5f, iconBox.top + 2.5f, tint(micCol), 1.55f);
-            if (inUse) d.circle(slot.right - 5.5f, slot.top + 7.f, 2.3f, tint(micCol));
-            if (down > 0.005f) d.target->SetTransform(prev);
-            cx += 30.f;
-            if (showKey) cx += 2.f;
-        }
-        if (showKey) {
-            const Box slot = box(cx, itemTop, 34.f, itemH);
-            if (isPrimary) statusKeyboardHit = slot;
-            const bool active = isPrimary && panel && !sheetClosing && page == KeyboardLang;
-            hit(view, slot, [this, mid = (slot.left + slot.right) / 2.f] { open(KeyboardLang, mid); },
-                [this] { cycleKeyboardLayout(1); });
-            const float hot = view.hoverAmount();
-            const float down = view.pressAmount();
-            drawPillBg(slot, hot, active);
-            const Text code = extra.keyboardShort.empty() ? L"TR" : extra.keyboardShort;
-            D2D1::Matrix3x2F prev{};
-            if (down > 0.005f) {
-                d.target->GetTransform(&prev);
-                const float s = 1.f - 0.06f * down;
-                d.target->SetTransform(D2D1::Matrix3x2F::Scale(s, s, {slot.left + 17.f, slot.top + itemH / 2.f}) * prev);
-            }
-            if (!extra.keyboardSub.empty()) {
-                d.text(code, box(slot.left, slot.top + 4.f, width(slot), 18.f), Caption, tint(p.ink), Center);
-                d.text(extra.keyboardSub, box(slot.left, slot.top + 21.f, width(slot), 15.f), Micro, tint(p.muted), Center);
-            } else {
-                d.text(code, slot, Strong, tint(p.ink), Center);
-            }
-            if (down > 0.005f) d.target->SetTransform(prev);
-            cx += 34.f;
-        }
-        prevGroup = true;
+    switch (id) {
+    case HiddenTrayControl:
+        icon(active == (model.edge == 0) ? ChevronDown : ChevronUp, 16.f, tint(ink, .88f + .12f * hot));
+        break;
+    case StatusMic: {
+        const bool muted = !preview && extra.microphoneMute == 1;
+        const bool inUse = preview || (!extra.micActiveApps.empty() && !muted);
+        const unsigned color = muted ? Design::focusRed(p.light) :
+            inUse ? (p.light ? 0x078D82 : 0x45E5D8) : ink;
+        icon(MicIcon, 18.f, tint(color, !preview && extra.microphoneMute < 0 ? .45f : .95f));
+        if (muted) d.line(centerX - 6.f, centerY + 6.f, centerX + 6.f, centerY - 6.f, tint(color), 1.55f);
+        if (inUse) d.circle(b.right - 7.f, b.top + 12.f, 2.3f, tint(color));
+        break;
     }
-
-    // Group 2: Internet Connection + Volume + Battery (each opens its own dedicated panel)
-    if (showNet || showVol || showBat) {
-        if (prevGroup) drawDivider();
-        if (showNet) {
-            const Box slot = box(cx, itemTop, 32.f, itemH);
-            const bool netOpen = isPrimary && panel && !sheetClosing && page == NetworkPanel;
-            const bool eth = extra.radios.ethernet || extra.netEthernetFast;
-            const bool wifi = extra.wifiConnected || !extra.radios.network.empty() || extra.netWifiFast;
-            const bool airplane = extra.radios.airplane;
-            hit(view, slot, [this, mid = (slot.left + slot.right) / 2.f] { open(NetworkPanel, mid); },
-                [this] { launch(L"ms-settings:network-status"); });
-            const float hot = view.hoverAmount();
-            const float down = view.pressAmount();
-            drawPillBg(slot, hot, netOpen);
-            const Glyph netGlyph = airplane ? Plane : eth ? EthernetIcon : wifi ? Wifi : GlobeOff;
-            const unsigned netCol = (!eth && !wifi && !airplane) ? p.muted : p.ink;
-            D2D1::Matrix3x2F prev{};
-            if (down > 0.005f) {
-                d.target->GetTransform(&prev);
-                const float s = 1.f - 0.07f * down;
-                d.target->SetTransform(D2D1::Matrix3x2F::Scale(s, s, {slot.left + 16.f, slot.top + itemH / 2.f}) * prev);
-            }
-            d.icon(netGlyph, d.snap(box(slot.left + 6.f, slot.top + (itemH - 20.f) / 2.f, 20.f, 20.f)), tint(netCol, .96f));
-            if (down > 0.005f) d.target->SetTransform(prev);
-            cx += 32.f;
-            if (showVol || showBat) cx += 2.f;
+    case StatusKeyboard: {
+        const Text code = preview || extra.keyboardShort.empty() ? L"TR" : extra.keyboardShort;
+        if (preview || extra.keyboardSub.empty()) d.text(code, b, Strong, tint(ink), Center);
+        else {
+            d.text(code, box(b.left, centerY - 15.f, width(b), 18.f), Caption, tint(ink), Center);
+            d.text(extra.keyboardSub, box(b.left, centerY + 2.f, width(b), 15.f), Micro, tint(p.muted), Center);
         }
-        if (showVol) {
-            const Box slot = box(cx, itemTop, 32.f, itemH);
-            const bool volOpen = isPrimary && panel && !sheetClosing && page == Volume;
-            if (isPrimary) statusVolumeHit = slot;
-            hit(view, slot, [this, mid = (slot.left + slot.right) / 2.f] { open(Volume, mid); },
-                [this] { changeVolume(0, true); });
-            const float hot = view.hoverAmount();
-            const float down = view.pressAmount();
-            drawPillBg(slot, hot, volOpen);
-            const bool isMuted = extra.muted || extra.volume == 0;
-            const Glyph volGlyph = isMuted ? SpeakerMuted : (extra.volume >= 0 && extra.volume < 45) ? SpeakerLow : Speaker;
-            D2D1::Matrix3x2F prev{};
-            if (down > 0.005f) {
-                d.target->GetTransform(&prev);
-                const float s = 1.f - 0.07f * down;
-                d.target->SetTransform(D2D1::Matrix3x2F::Scale(s, s, {slot.left + 16.f, slot.top + itemH / 2.f}) * prev);
-            }
-            d.icon(volGlyph, d.snap(box(slot.left + 6.f, slot.top + (itemH - 20.f) / 2.f, 20.f, 20.f)),
-                tint(isMuted ? p.muted : p.ink, isMuted ? .80f : .96f));
-            if (down > 0.005f) d.target->SetTransform(prev);
-            cx += 32.f;
-            if (showBat) cx += 2.f;
-        }
-        if (showBat) {
-            const Box slot = box(cx, itemTop, 32.f, itemH);
-            const bool batOpen = isPrimary && panel && !sheetClosing && page == Power;
-            hit(view, slot, [this, mid = (slot.left + slot.right) / 2.f] { open(Power, mid); },
-                [this] { launch(L"ms-settings:powersleep"); });
-            const float hot = view.hoverAmount();
-            const float down = view.pressAmount();
-            drawPillBg(slot, hot, batOpen);
-            D2D1::Matrix3x2F prev{};
-            if (down > 0.005f) {
-                d.target->GetTransform(&prev);
-                const float s = 1.f - 0.07f * down;
-                d.target->SetTransform(D2D1::Matrix3x2F::Scale(s, s, {slot.left + 16.f, slot.top + itemH / 2.f}) * prev);
-            }
-            // Windows 11 style horizontal battery with live fill & green charging bolt
-            const float bx = slot.left + 5.f;
-            const float by = slot.top + (itemH - 13.f) / 2.f;
-            const Box body = box(bx, by, 19.5f, 13.f);
-            d.outline(body, 3.2f, tint(p.ink, .88f), 1.35f);
-            d.fill(box(body.right + 1.f, by + 4.f, 2.f, 5.f), .9f, tint(p.ink, .82f));
-            const float pct = std::clamp(battery / 100.f, 0.f, 1.f);
-            const float innerW = std::max(2.f, 14.5f * pct);
-            const unsigned fillCol = extra.plugged ? (p.light ? 0x1FA65A : 0x7BE495)
-                : battery <= 15 ? Design::Red
-                : battery <= 25 ? Design::Amber
-                : p.ink;
-            if (pct > 0.01f) d.fill(box(bx + 2.5f, by + 2.5f, innerW, 8.f), 1.6f, tint(fillCol, .94f));
-            if (extra.plugged) {
-                const float lx = bx + 9.8f, ly = by + 6.5f;
-                const Color boltCol = tint(p.light ? 0x121214 : 0x101412, .96f);
-                d.path({{lx + 1.2f, ly - 5.2f}, {lx - 2.2f, ly + .4f}, {lx + .6f, ly + .4f}, {lx - 1.2f, ly + 5.2f}},
-                    boltCol, 1.45f);
-            }
-            if (down > 0.005f) d.target->SetTransform(prev);
-            cx += 32.f;
-        }
-        prevGroup = true;
+        break;
     }
-
-    // Group 3: Clock & Date + Notifications Bell
-    if (showClock || showBell) {
-        if (prevGroup) drawDivider();
-        const bool notifOpen = isPrimary && panel && !sheetClosing && (page == NotificationCenter || page == Calendar || page == Clock);
-        if (showClock) {
-            const Box slot = box(cx, itemTop, 68.f, itemH);
-            hit(view, slot, [this, mid = (slot.left + slot.right) / 2.f] { open(NotificationCenter, mid); },
-                [this] { launch(L"ms-settings:dateandtime"); });
-            const float hot = view.hoverAmount();
-            drawPillBg(slot, hot, notifOpen);
-            const auto t = now();
-            const Text timeStr = two(t.wHour) + L":" + two(t.wMinute);
-            const Text dateStr = two(t.wDay) + L"." + two(t.wMonth) + L"." + num(t.wYear);
-            d.text(timeStr, box(slot.left + 2.f, slot.top + 3.f, width(slot) - 6.f, 18.f), Strong, tint(p.ink), Right);
-            d.text(dateStr, box(slot.left + 2.f, slot.top + 21.f, width(slot) - 6.f, 16.f), Small, tint(p.muted), Right);
-            cx += 68.f;
-            if (showBell) cx += 2.f;
+    case StatusNetwork: {
+        const bool ethernet = !preview && (extra.radios.ethernet || extra.netEthernetFast);
+        const bool wifi = preview || extra.wifiConnected || !extra.radios.network.empty() || extra.netWifiFast;
+        const bool airplane = !preview && extra.radios.airplane;
+        icon(airplane ? Plane : ethernet ? EthernetIcon : wifi ? Wifi : GlobeOff, 20.f,
+            tint(ethernet || wifi || airplane ? ink : p.muted, .96f));
+        break;
+    }
+    case StatusVolume: {
+        const bool muted = !preview && (extra.muted || extra.volume == 0);
+        icon(muted ? SpeakerMuted : !preview && extra.volume >= 0 && extra.volume < 45 ? SpeakerLow : Speaker,
+            20.f, tint(muted ? p.muted : ink, muted ? .8f : .96f));
+        break;
+    }
+    case StatusBattery: {
+        const int percent = preview ? 76 : battery;
+        const bool charging = preview || extra.plugged;
+        const auto body = box(centerX - 11.25f, centerY - 6.5f + down, 19.5f, 13.f);
+        const Color outline = tint(percent < 0 ? p.muted : ink, .88f);
+        d.outline(body, 3.2f, outline, 1.35f);
+        d.fill(box(body.right + 1.f, body.top + 4.f, 2.f, 5.f), .9f, outline);
+        const unsigned fill = charging ? (p.light ? 0x1FA65A : 0x7BE495) :
+            percent <= 15 ? Design::Red : percent <= 25 ? Design::Amber : p.ink;
+        if (percent > 0) d.fill(box(body.left + 2.5f, body.top + 2.5f, 14.5f * percent / 100.f, 8.f), 1.6f, tint(fill));
+        if (charging && percent >= 0) {
+            const float x = body.left + 9.8f, y = body.top + 6.5f;
+            d.path({{x + 1.2f, y - 5.2f}, {x - 2.2f, y + .4f}, {x + .6f, y + .4f}, {x - 1.2f, y + 5.2f}},
+                tint(p.light ? 0x121214 : 0x101412), 1.45f);
         }
-        if (showBell) {
-            const Box slot = box(cx, itemTop, 26.f, itemH);
-            hit(view, slot, [this, mid = (slot.left + slot.right) / 2.f] { open(NotificationCenter, mid); },
-                [this] { launch(L"ms-settings:notifications"); });
-            const float hot = view.hoverAmount();
-            const float down = view.pressAmount();
-            drawPillBg(slot, hot, notifOpen);
-            D2D1::Matrix3x2F prev{};
-            if (down > 0.005f) {
-                d.target->GetTransform(&prev);
-                const float s = 1.f - 0.07f * down;
-                d.target->SetTransform(D2D1::Matrix3x2F::Scale(s, s, {slot.left + 13.f, slot.top + itemH / 2.f}) * prev);
-            }
-            const unsigned bellCol = extra.dndEnabled ? (p.light ? 0x078D82 : 0x45E5D8) : p.ink;
-            d.icon(BellIcon, box(slot.left + 4.5f, slot.top + (itemH - 17.f) / 2.f, 17.f, 17.f), tint(bellCol, .90f));
-            if (extra.dndEnabled) {
-                d.circle(slot.right - 5.f, slot.top + 7.5f, 2.3f, tint(bellCol));
-            } else if (!extra.notifications.empty()) {
-                d.circle(slot.right - 5.f, slot.top + 7.5f, 2.4f, tint(p.light ? 0x0A7AFF : 0x4DA3FF));
-            }
-            if (down > 0.005f) d.target->SetTransform(prev);
-            cx += 26.f;
-        }
+        break;
+    }
+    case StatusClock: {
+        const auto t = preview ? catalogTime : now();
+        d.text(two(t.wHour) + L":" + two(t.wMinute), box(b.left + 2.f, centerY - 16.f, width(b) - 4.f, 18.f),
+            Strong, tint(ink), Center);
+        d.text(two(t.wDay) + L"." + two(t.wMonth) + L"." + num(t.wYear), box(b.left + 2.f, centerY + 2.f, width(b) - 4.f, 16.f),
+            Small, tint(p.muted), Center);
+        break;
+    }
+    case StatusNotifications: {
+        const bool dnd = !preview && extra.dndEnabled;
+        const unsigned color = dnd ? (p.light ? 0x078D82 : 0x45E5D8) : ink;
+        icon(BellIcon, 17.f, tint(color, .90f));
+        if (dnd || preview || !extra.notifications.empty())
+            d.circle(b.right - 7.f, b.top + 12.f, 2.3f, tint(dnd ? color : p.accent));
+        break;
+    }
+    case DesktopStripControl: {
+        const float half = 11.f + 2.5f * hot - 1.5f * down;
+        d.line(centerX, centerY - half, centerX, centerY + half,
+            tint(ink, .45f + .35f * hot), 1.5f + .3f * hot);
+        break;
+    }
     }
 }
 

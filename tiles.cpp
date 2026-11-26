@@ -106,6 +106,12 @@ float Dock::widgetWidth(int id, bool preview) const {
         const float pitch = !preview && glassTheme(model.theme) ? Design::GlassAppPitch : Design::AppPitch;
         return 2 * Design::Pad + pitch * total + divider;
     }
+    if (!preview && statusWidget(id) && !dockEditMode) {
+        if (!model.statusBar.enabled) return 0.f;
+        if (id == StatusMic && model.statusBar.micOnlyInUse &&
+            extra.micActiveApps.empty() && extra.microphoneMute != 1) return 0.f;
+        if (id == StatusBattery && battery < 0) return 0.f;
+    }
     if (preview && id == Quick) return 128;
     return static_cast<float>(Widgets[id].width);
 }
@@ -113,6 +119,11 @@ float Dock::widgetWidth(int id, bool preview) const {
 void Dock::widgetCard(View& view, int id, Box b, Palette p, bool preview) {
     auto& d = view.d;
     b = d.snap(b);
+    if (dockControlWidget(id)) {
+        drawDockControl(view, id, b, p, preview);
+        if (!preview && dockEditMode) drawWidgetRemove(view, id, b, p);
+        return;
+    }
     const float w = width(b);
     auto at = [&](float x, float y, float width, float height) { return box(b.left + x, b.top + y, width, height); };
     const auto accent = Widgets[id].color;
@@ -169,7 +180,7 @@ void Dock::widgetCard(View& view, int id, Box b, Palette p, bool preview) {
         if (hover > 0.f) d.fill(b, Design::Radius, tint(0xFFFFFF, .035f * hover));
     } else if (preview) d.fill(b, 12, tint(p.high));
     else if (id == Apps && p.theme == BareTheme) p.card(d, b, Design::Radius);
-    else if (id != Apps) {
+    else if (id != Apps && id != Quick) {
         const float visible = opened ? 1.f : hover;
         const bool liveTile = p.glass && !preview;
         if (liveTile) {
@@ -299,15 +310,14 @@ void Dock::widgetCard(View& view, int id, Box b, Palette p, bool preview) {
                 active |= window.active;
             }
             const auto slot = slotAt(x);
-            const bool chrome = target && isChromeApp(app);
-            if (!preview) hit(view, slot, [this, app, target, editing, chrome, mid = b.left + x + 16] {
+            const OrderItem shortcutOrder{OrderKind::Shortcut, static_cast<int>(i)};
+            if (!preview) hit(view, slot, [this, app, target, editing, shortcutOrder, mid = b.left + x + 16] {
                 if (editing) return;
-                if (chrome) showChromeWindows(mid);
-                else if (target && IsWindow(target)) activateWindow(target, true);
+                if (target && IsWindow(target)) activateAppDock(shortcutOrder, target, mid);
                 else launchShortcut(app);
             }, [this, app, target, image = appImages[i], mid = b.left + x + 16] { showAppMenu(app, mid, target, image); });
-            if (!preview && !editing) view.hits.back().chromePreview = chrome;
-            if (!preview) view.hits.back().order = {OrderKind::Shortcut, static_cast<int>(i)};
+            if (!preview && !editing) view.hits.back().windowPreview = target != nullptr;
+            if (!preview) view.hits.back().order = shortcutOrder;
             if (!preview && page == AppMenu && panelDockX >= 0 && app.target == contextApp.target)
                 panelDockX = b.left + x + 16;
             const float hot = !preview && !editing ? view.hoverAmount() : 0;
@@ -328,15 +338,14 @@ void Dock::widgetCard(View& view, int id, Box b, Palette p, bool preview) {
         for (size_t i : running) {
             const auto& win = extra.windows[i];
             const auto slot = slotAt(x);
-            const bool chrome = isChromeApp(win.app);
-            hit(view, slot, [this, editing, chrome, target = win.handle, mid = b.left + x + 16] {
+            const OrderItem winOrder{OrderKind::Window, -1, win.handle};
+            hit(view, slot, [this, editing, winOrder, target = win.handle, mid = b.left + x + 16] {
                 if (editing) return;
-                if (chrome) showChromeWindows(mid);
-                else activateWindow(target, true);
+                activateAppDock(winOrder, target, mid);
             },
                 [this, target = win.handle, mid = b.left + x + 16] { showWindowMenu(target, mid); });
-            if (!editing) view.hits.back().chromePreview = chrome;
-            view.hits.back().order = {OrderKind::Window, -1, win.handle};
+            if (!editing) view.hits.back().windowPreview = true;
+            view.hits.back().order = winOrder;
             if (&view == &bar && page == AppMenu && panelDockX >= 0 && contextWindow == win.handle) panelDockX = b.left + x + 16;
             const float hot = !editing ? view.hoverAmount() : 0;
             if (p.glass) d.glassRim(inset(slot, 2), 13, win.active ? .50f : .29f);
@@ -768,7 +777,8 @@ void Dock::widgetCard(View& view, int id, Box b, Palette p, bool preview) {
     }
     case OpenWindows: headline(Layers, extra.windows.empty() && !shown(id) ? L"—" : num(extra.windows.size()), L"Açık pencere"); break;
     case Quick:
-        d.icon(Sliders, at((w - 23) / 2, 16, 23, 23), tint(hover > 0 ? (p.light ? 0x0A7AFF : 0x62B0FF) : p.ink));
+        d.icon(Sliders, d.snap(at((w - 23.f) / 2.f, (height(b) - 23.f) / 2.f, 23.f, 23.f)),
+            tint(mixRgb(p.ink, p.accent, opened ? .75f : .36f * hover)));
         break;
     case QuickToggles:
         drawQuickToggles(view, b, p, preview);
@@ -811,23 +821,26 @@ void Dock::widgetCard(View& view, int id, Box b, Palette p, bool preview) {
         if (proWidget(id)) drawProWidget(view, id, b, p, preview, editing);
         break;
     }
-    if (editing) {
-        const float cx = b.right - 5.f, cy = b.top + 5.f;
-        const float pop = std::clamp(dockEditSpring.value, 0.f, 1.15f);
-        hit(view, box(b.right - 18.f, b.top - 5.f, 23.f, 23.f), [this, id] { toggleTile(id); });
-        const float hotRemove = view.hoverAmount();
-        const float badgeScale = pop * (1.f + 0.12f * hotRemove);
-        if (badgeScale > 0.05f) {
-            D2D1::Matrix3x2F ep{};
-            d.target->GetTransform(&ep);
-            d.target->SetTransform(D2D1::Matrix3x2F::Scale(badgeScale, badgeScale, {cx, cy}) * ep);
-            d.circle(cx, cy, 9.5f, tint(p.base));
-            d.circle(cx, cy, 8.2f, tint(mixRgb(Design::Red, 0xFF6B65, hotRemove)));
-            d.icon(Minus, box(cx - 5.f, cy - 5.f, 10.f, 10.f), tint(0xFFFFFF));
-            d.target->SetTransform(ep);
-        }
-    }
+    if (editing) drawWidgetRemove(view, id, b, p);
     if (press > 0.005f) d.target->SetTransform(pressPrev);
+}
+
+void Dock::drawWidgetRemove(View& view, int id, Box b, Palette p) {
+    auto& d = view.d;
+    const float cx = b.right - 5.f, cy = b.top + 5.f;
+    const float pop = std::clamp(dockEditSpring.value, 0.f, 1.15f);
+    hit(view, box(b.right - 18.f, b.top - 5.f, 23.f, 23.f), [this, id] { toggleTile(id); });
+    const float hotRemove = view.hoverAmount();
+    const float badgeScale = pop * (1.f + 0.12f * hotRemove);
+    if (badgeScale > 0.05f) {
+        D2D1::Matrix3x2F ep{};
+        d.target->GetTransform(&ep);
+        d.target->SetTransform(D2D1::Matrix3x2F::Scale(badgeScale, badgeScale, {cx, cy}) * ep);
+        d.circle(cx, cy, 9.5f, tint(p.base));
+        d.circle(cx, cy, 8.2f, tint(mixRgb(Design::Red, 0xFF6B65, hotRemove)));
+        d.icon(Minus, box(cx - 5.f, cy - 5.f, 10.f, 10.f), tint(0xFFFFFF));
+        d.target->SetTransform(ep);
+    }
 }
 
 void Dock::drawAppSlot(View& view, OrderItem item, Box slot, Palette p, float dragLift) {
@@ -902,12 +915,10 @@ void Dock::drawAppSlot(View& view, OrderItem item, Box slot, Palette p, float dr
             pinnedWindowRevision = dockRevision;
         }
         const auto [target, active] = pinnedWindows[i];
-        const bool chrome = target && isChromeApp(app);
         const auto image = i < appImages.size() ? appImages[i] : std::shared_ptr<Gdiplus::Bitmap>{};
-        hit(view, slot, [this, i, target, editing, chrome, mid] {
+        hit(view, slot, [this, i, item, target, editing, mid] {
             if (editing) return;
-            if (chrome) showChromeWindows(mid);
-            else if (target && IsWindow(target)) activateWindow(target, true);
+            if (target && IsWindow(target)) activateAppDock(item, target, mid);
             else if (i < model.shortcuts.size()) launchShortcut(model.shortcuts[i]);
         }, [this, i, target, mid] {
             if (i < model.shortcuts.size()) {
@@ -915,7 +926,7 @@ void Dock::drawAppSlot(View& view, OrderItem item, Box slot, Palette p, float dr
                 showAppMenu(model.shortcuts[i], mid, target, img);
             }
         });
-        if (!editing) view.hits.back().chromePreview = chrome;
+        if (!editing) view.hits.back().windowPreview = target != nullptr;
         view.hits.back().order = item;
         if (&view == &bar && page == AppMenu && panelDockX >= 0 && app.target == contextApp.target) panelDockX = mid;
         const float hot = !editing && !dockOrderDragging ? view.hoverAmount() : 0.f;
@@ -938,13 +949,11 @@ void Dock::drawAppSlot(View& view, OrderItem item, Box slot, Palette p, float dr
             [&](const OpenWindow& w) { return w.handle == item.window; });
         if (found == extra.windows.end()) return;
         const auto& win = *found;
-        const bool chrome = isChromeApp(win.app);
-        hit(view, slot, [this, editing, chrome, target = win.handle, mid] {
+        hit(view, slot, [this, editing, item, target = win.handle, mid] {
             if (editing) return;
-            if (chrome) showChromeWindows(mid);
-            else activateWindow(target, true);
+            activateAppDock(item, target, mid);
         }, [this, target = win.handle, mid] { showWindowMenu(target, mid); });
-        if (!editing) view.hits.back().chromePreview = chrome;
+        if (!editing) view.hits.back().windowPreview = true;
         view.hits.back().order = item;
         if (&view == &bar && page == AppMenu && panelDockX >= 0 && contextWindow == win.handle) panelDockX = mid;
         const float hot = !editing && !dockOrderDragging ? view.hoverAmount() : 0.f;

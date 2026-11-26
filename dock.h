@@ -111,7 +111,7 @@ struct DockAnimPos {
     LiveDockItem key;
     float x = 0.f, vel = 0.f;
 };
-struct Hit { Box bounds; std::function<void()> action, secondary; bool chromePreview = false; OrderItem order{}; };
+struct Hit { Box bounds; std::function<void()> action, secondary; bool windowPreview = false; OrderItem order{}; };
 struct View {
     HWND hwnd{};
     Draw d;
@@ -193,6 +193,7 @@ public:
     std::vector<HWND> trayIgnoredPopups;
     TrayMenuItem trayPendingExec;
     bool trayLoading = false, trayNeedsReveal = false, trayOverflowSettled = false, trayRightClickPending = false;
+    bool trayActionOnTaskbar = false, trayUsedKeyboardMenu = false, trayFallbackMouseSent = false;
     int trayRightClickStep = 0;
     HWINEVENTHOOK trayHook{};
     struct TrayCaptureResult {
@@ -225,8 +226,10 @@ public:
     bool switchWasOn = false;
     double switchAtMs = 0.0;
     int page = -1, tab = 0, listOffset = 0, catalogGroup = 0, catalogPage = 0, orderPage = 0;
+    std::vector<HWND> chromeWindowOrder;
     std::vector<WindowPreview> chromeWindows;
     std::future<std::vector<WindowPreview>> chromePreviewRead;
+    OrderItem previewTarget{}, hoverPreviewOrder{};
     ULONGLONG chromeHoverSince = 0, chromeLeftAt = 0;
     bool chromeHoverPanel = false, chromeHoverTracking = false, chromeIconHovered = false;
     int dragSource = -1, dragTarget = -1;
@@ -468,7 +471,9 @@ public:
     const std::vector<TrayMenuItem>& currentTrayMenu() const;
     Text trayMenuTitle() const;
     void updateTraySync();
-    void stopTraySync();
+    void stopTraySync(bool forceRestore = false);
+    void pollDeferredTrayUncloak();
+    Design::TrayGridLayout trayGridLayout() const;
     bool trayBusy() const { return trayAction != TrayAction::None; }
     bool invokeSystemTray();
     void requestNativeFlyout(NativeFlyout flyout);
@@ -505,7 +510,8 @@ public:
     void toggleDesktop();
     void queryMedia();
     bool mediaInUse() const;
-    void sampleMicrophone(bool toggle = false);
+    void sampleMicrophone(bool toggle = false, bool refresh = false);
+    bool pollMicrophone();
     void microphonePanel(Palette p);
     void refreshMicEndpoints();
     void setMicEndpoint(const Text& deviceId);
@@ -524,17 +530,21 @@ public:
     void toggleDoNotDisturb();
     void sampleNetworkFast();
     float statusBarWidth() const;
-    float trailingWidth() const;
-    void drawStatusBar(View& view, float x, Palette p);
+    bool statusShown(int id) const { return model.statusBar.enabled && shown(id); }
+    void drawDockControl(View& view, int id, Box b, Palette p, bool preview);
+    void activateDockControl(int id, float anchor = -1);
+    void drawWidgetRemove(View& view, int id, Box b, Palette p);
     void drawQuickToggles(View& view, Box b, Palette p, bool preview, bool labels = false);
     void showAppMenu(Shortcut app, float x = -1, HWND window = nullptr, std::shared_ptr<Gdiplus::Bitmap> icon = {});
     void sizeAppMenu();
     void pollJumpList();
     void launchJumpItem(const JumpItem& item);
     void closeAppWindows(const std::vector<HWND>& windows);
-    void showChromeWindows(float x, bool hover = false);
+    void showWindowPreviews(OrderItem target, float x, bool hover = false);
+    void activateAppDock(OrderItem item, HWND fallback, float x);
     void trackChromeHover();
     void updateChromeHover();
+    void rememberChromeWindow(HWND window);
     bool syncChromeWindows(bool renew = false);
     void refreshChromeWindows();
     void updateChromePreviews();
@@ -585,7 +595,7 @@ public:
     void resetTimer(int id);
     void setTimerMinutes(int id, int minutes);
     bool applyTimerInput();
-    void openOverflow();
+    void openOverflow(float anchor);
     void media(WORD key);
 
     void paintBar(const POINT* origin = nullptr, bool repaintOtherDocks = true);

@@ -217,19 +217,42 @@ void Dock::animateFrame() {
     if (switchMoving && nowMs - switchAtMs >= 180.0) switchAtMs = 0.0;
     const bool rimsMoving = timerRimMoving(nowMs);
 
-    const bool sharedBarFrame = (hadPanel && !panel) || volFrame || editMoving || metersMoving ||
+    const bool sharedBarFrame = (hadPanel && !panel) || editMoving ||
         appIndMoving || bounceMoving || analogMoving || flipMoving || segMoving || widgetMoving ||
         rimsMoving || (!panel && noticeFading);
-    const bool barFrame = sharedBarFrame || dragFrame || barHoverMoving || waveMoving;
+    const auto movingBarWidget = [&](const OrderItem& item) {
+        if (item.kind != OrderKind::Widget) return false;
+        switch (item.index) {
+        case Volume: return volFrame;
+        case System: return cpuMoving || ramMoving;
+        case CpuMeter: return cpuMoving;
+        case RamMeter: return ramMoving;
+        case Power: return batMoving;
+        case Tasks: return taskMoving;
+        default: return false;
+        }
+    };
+    const auto hasMovingWidgets = [&](const View& view) {
+        return (volFrame || metersMoving) && std::any_of(view.placement.begin(), view.placement.end(),
+            [&](const auto& cell) { return movingBarWidget(cell.item); });
+    };
+    const bool barFrame = sharedBarFrame || dragFrame || barHoverMoving || waveMoving || hasMovingWidgets(bar);
     const bool sheetFrame = panel && !sheetClosing && (sheetHoverMoving || switchMoving || navMoving ||
         contentMoving || usageMoving || opMoving || noticeFading ||
         (volFrame && (page == Quick || page == Volume)) ||
-        (metersMoving && (page == System || page == Power || page == Tasks)) ||
+        ((cpuMoving || ramMoving || batMoving) && page == System) ||
+        (batMoving && page == Power) || (taskMoving && page == Tasks) ||
         (widgetMoving && (marketWidget(page) || page == DayTimeline)) ||
         (rimsMoving && (page == Focus || page == Countdown || page == Stopwatch)));
 
-    if (barFrame && anyDockVisible()) paintBar(barOrigin ? &*barOrigin : nullptr, sharedBarFrame);
+    if (barFrame && (!hidden || barOrigin)) paintBarView(bar, folded, barOrigin ? &*barOrigin : nullptr);
     else if (barOrigin) bar.d.present(&*barOrigin);
+    if (sharedBarFrame || volFrame || metersMoving) {
+        for (auto& entry : otherDocks) {
+            if (!entry->hidden && entry->view.w > 0 && (sharedBarFrame || hasMovingWidgets(entry->view)))
+                paintBarView(entry->view, entry->folded);
+        }
+    }
     if (sheetFrame) paintSheet(sheetOrigin ? &*sheetOrigin : nullptr);
     else if (sheetOrigin) sheet.d.present(&*sheetOrigin);
 
@@ -616,6 +639,14 @@ HWINEVENTHOOK gWindowHooks[3]{};
 
 void CALLBACK windowWinEventProc(HWINEVENTHOOK, DWORD event, HWND window, LONG idObject, LONG idChild, DWORD, DWORD) {
     if (!gWindowHookDock || !window || idObject != OBJID_WINDOW || idChild != CHILDID_SELF) return;
+    if (event == EVENT_OBJECT_CREATE) {
+        wchar_t windowClass[64]{};
+        if (GetAncestor(window, GA_ROOT) == window &&
+            GetClassNameW(window, windowClass, ARRAYSIZE(windowClass)) &&
+            CompareStringOrdinal(windowClass, -1, L"Chrome_WidgetWin_1", -1, TRUE) == CSTR_EQUAL)
+            gWindowHookDock->rememberChromeWindow(window);
+        return;
+    }
     if (event != EVENT_SYSTEM_FOREGROUND &&
         event != EVENT_SYSTEM_MINIMIZESTART && event != EVENT_SYSTEM_MINIMIZEEND &&
         event != EVENT_OBJECT_SHOW && event != EVENT_OBJECT_HIDE && event != EVENT_OBJECT_DESTROY &&
@@ -624,6 +655,7 @@ void CALLBACK windowWinEventProc(HWINEVENTHOOK, DWORD event, HWND window, LONG i
     DWORD pid = 0;
     GetWindowThreadProcessId(window, &pid);
     if (pid == GetCurrentProcessId()) return;
+    if (event == EVENT_OBJECT_DESTROY) std::erase(gWindowHookDock->chromeWindowOrder, window);
     if (event != EVENT_OBJECT_DESTROY && event != EVENT_OBJECT_HIDE && event != EVENT_OBJECT_CLOAKED) {
         if (GetAncestor(window, GA_ROOT) != window) return;
         const LONG_PTR ex = GetWindowLongPtrW(window, GWL_EXSTYLE);
@@ -638,7 +670,7 @@ void Dock::startWindowHook() {
     gWindowHookDock = this;
     gWindowHooks[0] = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND, nullptr,
         windowWinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
-    gWindowHooks[1] = SetWinEventHook(EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE, nullptr,
+    gWindowHooks[1] = SetWinEventHook(EVENT_OBJECT_CREATE, EVENT_OBJECT_HIDE, nullptr,
         windowWinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
     gWindowHooks[2] = SetWinEventHook(EVENT_OBJECT_CLOAKED, EVENT_OBJECT_UNCLOAKED, nullptr,
         windowWinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
@@ -672,7 +704,6 @@ void Dock::completeDeferredStartup() {
     }
     tray(true);
     sampleExtras(true);
-    startWindowHook();
     SetTimer(hwnd, WarmupTick, 900, nullptr);
 }
 
@@ -714,13 +745,14 @@ bool Dock::initialize() {
     animationTimer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
         TIMER_MODIFY_STATE | SYNCHRONIZE);
     bar.hwnd = hwnd;
+    startWindowHook();
     registerAppDrop(hwnd);
     trayRestore = RegisterWindowMessageW(L"TaskbarCreated");
     sample();
     if (model.statusBar.enabled) {
-        if (model.statusBar.keyboard) sampleKeyboardLayout();
-        if (model.statusBar.network) sampleNetworkFast();
-        if (model.statusBar.notifications) queryDoNotDisturb();
+        if (statusShown(StatusKeyboard)) sampleKeyboardLayout();
+        if (statusShown(StatusNetwork)) sampleNetworkFast();
+        if (statusShown(StatusNotifications)) queryDoNotDisturb();
     }
     if (cpu >= 0) cpuAnim.snap(static_cast<float>(cpu));
     ramAnim.snap(static_cast<float>(ram));
@@ -965,6 +997,8 @@ float Dock::dockItemSpan(OrderItem item) const {
 }
 
 float Dock::dockGapBetween(OrderItem prev, OrderItem curr) const {
+    if (prev.kind == OrderKind::Widget && curr.kind == OrderKind::Widget &&
+        statusWidget(prev.index) && statusWidget(curr.index)) return 2.f;
     if (prev.kind == OrderKind::Shortcut && curr.kind == OrderKind::Window) return 8.f;
     if (isAppKind(prev.kind) && isAppKind(curr.kind)) return 0.f;
     return Design::Gap;
@@ -1007,7 +1041,7 @@ bool Dock::layoutMonitorDock(HMONITOR monitor, View& view, RECT& area, RECT& bou
     }
     const float available = (area.right - area.left - 24) / view.scale;
     const float trailing = dockEditMode ? 82.f : 0.f;
-    view.w = Design::DockLeading + Design::DockInset + trailingWidth();
+    view.w = Design::DockLeading + Design::DockInset;
     const auto& items = dockItems();
     float required = view.w + trailing;
     for (size_t i = 0; i < items.size(); ++i) {
@@ -1091,6 +1125,14 @@ void Dock::switchQuickPage(int next) {
     positionSheet();
 }
 
+Design::TrayGridLayout Dock::trayGridLayout() const {
+    const float dpi = bar.hwnd ? std::max(1.f, GetDpiForWindow(bar.hwnd) / 96.0f) : 1.f;
+    const float dockHeight = static_cast<float>(px(bar.h * bar.scale));
+    const float maxW = std::max(260.f, (work.right - work.left - 32.f) / dpi * 0.72f);
+    const float maxH = std::max(240.f, ((work.bottom - work.top) - (dockHeight + 36.f)) / dpi * 0.78f);
+    return Design::computeTrayGrid(static_cast<int>(trayIcons.size()), maxW, maxH);
+}
+
 void Dock::positionSheet(bool reopening) {
     if (!panel || sheetClosing) return;
     const int dockHeight = px(bar.h * bar.scale);
@@ -1099,7 +1141,7 @@ void Dock::positionSheet(bool reopening) {
     sheet.h = page == Studio ? Design::StudioHeight : wide ? 493 : 398;
     if (page == Quick && extra.quickSub == QuickSubPanel::Main && !extra.media.title.empty()) sheet.h = 468;
     if (page == Usage) sheet.h = 563;
-    if (page == AiLimits) sheet.h = 493;
+    if (page == AiLimits) sheet.h = 540;
     const float dpi = GetDpiForWindow(bar.hwnd) / 96.0f;
     if (page == Apps || page == Recent || page == Search || page == Commands) { sheet.w = 485; sheet.h = 428; }
     if (page == RecycleBin) sheet.h = 252;
@@ -1135,14 +1177,9 @@ void Dock::positionSheet(bool reopening) {
                 sheet.h = std::clamp(contentH, 96.f, 520.f);
             }
         } else {
-            constexpr float tile = Design::TrayTileSize, gap = Design::TrayTileGap;
-            const int count = static_cast<int>(trayIcons.size());
-            const int cols = (count > 0 && count < 5) ? count : 5;
-            const int rows = count ? std::min(4, (count + cols - 1) / cols) : 1;
-            const float gridW = cols * tile + (cols - 1) * gap;
-            const float gridH = rows * tile + (rows - 1) * gap;
-            sheet.w = count ? std::max(168.f, gridW + 2.f * Design::TrayGridPadX) : 210.f;
-            sheet.h = count ? (gridH + 52.f) : 92.f;
+            const auto grid = trayGridLayout();
+            sheet.w = grid.width;
+            sheet.h = grid.height;
         }
     }
     if (page == Focus || page == Countdown) sheet.h = 424;
@@ -1362,6 +1399,7 @@ void Dock::closeSheet(bool redrawBar) {
     if (page == ChromeWindows) {
         chromeHoverPanel = false;
         chromeLeftAt = 0;
+        previewTarget = {};
     }
     page = -1;
     timerInput.reset();
@@ -1728,7 +1766,7 @@ int Dock::dockDropAt(int x, int y) const {
     const float localX = x / bar.scale, localY = y / bar.scale;
     if (localY < -90.f || localY > bar.h + 90.f) return -1;
     std::vector<OrderItem> visible;
-    const auto all = const_cast<Dock*>(this)->dockItems();
+    const auto& all = const_cast<Dock*>(this)->dockItems();
     for (const auto& item : all) {
         if (std::find(folded.begin(), folded.end(), item) == folded.end() && dockItemSpan(item) > 0)
             visible.push_back(item);
@@ -1744,16 +1782,26 @@ int Dock::dockDropAt(int x, int y) const {
     const float bandRight = base.back().x + base.back().span;
     const float dragLeft = std::clamp(localX - dockDragGrabX, bandLeft - 6.f, bandRight - srcSpan + 6.f);
     const float dragCenter = dragLeft + srcSpan / 2.f;
-    int bestDest = srcIdx;
-    float bestDist = 1e9f;
-    for (int d = 0; d < static_cast<int>(visible.size()); ++d) {
-        auto cand = visible;
-        if (d != srcIdx) moveEntry(cand, static_cast<size_t>(srcIdx), static_cast<size_t>(d));
-        const auto laid = layoutDockItems(cand);
-        const float center = laid[d].x + laid[d].span / 2.f;
+    int bestDest = 0, dest = 0;
+    float bestDist = std::numeric_limits<float>::infinity();
+    float prefixEnd = bandLeft;
+    OrderItem previous{};
+    const auto consider = [&] {
+        const float gap = previous ? dockGapBetween(previous, dockOrderSource) : 0.f;
+        const float center = (prefixEnd + gap) + srcSpan / 2.f;
         const float dist = std::abs(center - dragCenter);
-        if (dist < bestDist) { bestDist = dist; bestDest = d; }
+        if (dist < bestDist) { bestDist = dist; bestDest = dest; }
+    };
+    // The insertion position depends only on the items before the dragged card.
+    for (const auto& cell : base) {
+        if (cell.item == dockOrderSource) continue;
+        consider();
+        if (previous) prefixEnd += dockGapBetween(previous, cell.item);
+        prefixEnd += cell.span;
+        previous = cell.item;
+        ++dest;
     }
+    consider();
     return bestDest;
 }
 
@@ -2121,12 +2169,12 @@ void Dock::tick(bool pollWindows) {
         analogSecAtMs = animNowMs();
         startAnimTimer();
     }
+    const float prevStatusW = statusBarWidth();
+    bool sampled = pollMicrophone();
     bool dataChanged = tickExtras(stamp, t);
     dataChanged |= tickMarket();
     const bool timersChanged = updateTimers(stamp);
-    bool sampled = false;
-    const float prevStatusW = statusBarWidth();
-    if (model.statusBar.enabled && model.statusBar.keyboard) {
+    if (statusShown(StatusKeyboard)) {
         const HKL prevHkl = extra.activeKeyboardHkl;
         const Text prevShort = extra.keyboardShort, prevSub = extra.keyboardSub;
         sampleKeyboardLayout();
@@ -2135,12 +2183,11 @@ void Dock::tick(bool pollWindows) {
     }
     if (model.statusBar.enabled && (!extra.lastStatusFastAt || stamp - extra.lastStatusFastAt >= 2000)) {
         extra.lastStatusFastAt = stamp;
-        const int prevBat = battery, prevMic = extra.microphoneMute;
-        const auto prevApps = extra.micActiveApps;
+        const int prevBat = battery;
         const bool prevPlug = extra.plugged, prevEth = extra.netEthernetFast, prevWifi = extra.netWifiFast;
-        if (model.statusBar.microphone) sampleMicrophone();
-        if (model.statusBar.network) sampleNetworkFast();
-        if (model.statusBar.battery) {
+        if (statusShown(StatusMic)) sampleMicrophone();
+        if (statusShown(StatusNetwork)) sampleNetworkFast();
+        if (statusShown(StatusBattery)) {
             SYSTEM_POWER_STATUS power{};
             if (GetSystemPowerStatus(&power)) {
                 battery = power.BatteryLifePercent == 255 ? -1 : power.BatteryLifePercent;
@@ -2149,8 +2196,8 @@ void Dock::tick(bool pollWindows) {
                 syncMeterTargets();
             }
         }
-        if (battery != prevBat || extra.plugged != prevPlug || extra.microphoneMute != prevMic ||
-            extra.micActiveApps != prevApps || extra.netEthernetFast != prevEth || extra.netWifiFast != prevWifi)
+        if (battery != prevBat || extra.plugged != prevPlug ||
+            extra.netEthernetFast != prevEth || extra.netWifiFast != prevWifi)
             sampled = true;
     }
     static ULONGLONG lastCpuTick = 0;
@@ -2165,7 +2212,7 @@ void Dock::tick(bool pollWindows) {
     if (stamp >= slowTick) {
         slowTick = stamp + 4500;
         const int prevCpu = cpu, prevRam = ram, prevBat = battery;
-        const int prevVol = extra.volume, prevMic = extra.microphoneMute;
+        const int prevVol = extra.volume;
         const bool prevMuted = extra.muted, prevPlugged = extra.plugged;
         const long long prevDown = extra.download.back(), prevUp = extra.upload.back();
         const Text prevBranch = branch;
@@ -2173,7 +2220,7 @@ void Dock::tick(bool pollWindows) {
         sampleExtras();
         if (mediaInUse()) queryMedia();
         if (cpu != prevCpu || ram != prevRam || battery != prevBat ||
-            extra.volume != prevVol || extra.muted != prevMuted || extra.microphoneMute != prevMic ||
+            extra.volume != prevVol || extra.muted != prevMuted ||
             extra.plugged != prevPlugged || extra.download.back() != prevDown || extra.upload.back() != prevUp ||
             branch != prevBranch || page == Storage || page == OpenWindows) {
             sampled = true;
@@ -2207,9 +2254,9 @@ void Dock::tick(bool pollWindows) {
 void Dock::menu() {
     open(ContextMenu);
 }
-void Dock::openOverflow() {
+void Dock::openOverflow(float anchor) {
     if (folded.empty()) return;
-    open(Overflow, bar.w - trailingWidth() - Design::DockInset - Design::CardHeight / 2 - (dockEditMode ? 82 : 0));
+    open(Overflow, anchor);
 }
 void Dock::showSystemQuick() { requestNativeFlyout(NativeFlyout::Quick); }
 
@@ -2459,7 +2506,7 @@ LRESULT Dock::message(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         }
         const bool grip = orderSheet && orderRow(true) >= 0;
         const bool reorder = isBar && dockEditMode && index >= 0 && v.hits[index].order;
-        if (isBar && !dockEditMode && index >= 0 && v.hits[index].chromePreview) trackChromeHover();
+        if (isBar && !dockEditMode && index >= 0 && v.hits[index].windowPreview) trackChromeHover();
         SetCursor(grip ? curSizeAll : reorder ? curSizeWE :
             index < 0 ? curArrow : curHand);
         if (v.hover != index) {
@@ -2851,7 +2898,7 @@ LRESULT Dock::message(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             windowSyncScheduled = false;
             const int winState = refreshOpenWindows();
             bool kbChanged = false;
-            if (model.statusBar.enabled && model.statusBar.keyboard) {
+            if (statusShown(StatusKeyboard)) {
                 const HKL prevHkl = extra.activeKeyboardHkl;
                 const Text prevShort = extra.keyboardShort, prevSub = extra.keyboardSub;
                 sampleKeyboardLayout();
@@ -2926,6 +2973,7 @@ LRESULT Dock::message(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         if (isOwner && wp == 8) updateNativeFlyout();
         if (isOwner && wp == 10) updateTraySync();
         if (isOwner && wp == 11) finishCapture();
+        if (isOwner && wp == 12) pollDeferredTrayUncloak();
         if (isOwner && wp == AnimationTick && animTimerActive && !animationTimer) animateFrame();
         if (isOwner && wp == 4) {
             if (!dockEditMode) { KillTimer(hwnd, 4); return 0; }
@@ -2967,7 +3015,7 @@ LRESULT Dock::message(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             stopWindowHook();
             KillTimer(hwnd, WindowSyncTick);
             KillTimer(hwnd, WarmupTick);
-            stopTraySync(); KillTimer(hwnd, 10); closeSheet(); shellTaskbar.restore(); KillTimer(hwnd, 8); tray(false); KillTimer(hwnd, 1); KillTimer(hwnd, 3); KillTimer(hwnd, 4); releaseAudioEndpoint(); PostQuitMessage(0);
+            stopTraySync(true); KillTimer(hwnd, 10); KillTimer(hwnd, 12); closeSheet(); shellTaskbar.restore(); KillTimer(hwnd, 8); tray(false); KillTimer(hwnd, 1); KillTimer(hwnd, 3); KillTimer(hwnd, 4); releaseAudioEndpoint(); PostQuitMessage(0);
         }
         return 0;
     }

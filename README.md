@@ -7,7 +7,7 @@
 [![Platform](https://img.shields.io/badge/Windows-10%20%2F%2011%20(x64)-0078D6?style=flat-square&logo=windows)](https://github.com/kbudak/Vetra)
 [![Language](https://img.shields.io/badge/C%2B%2B-20-00599C?style=flat-square&logo=cplusplus)](https://github.com/kbudak/Vetra)
 [![Graphics](https://img.shields.io/badge/UI-Win32%20%2B%20Direct2D%20%2B%20DirectWrite-111827?style=flat-square)](https://github.com/kbudak/Vetra)
-[![Widgets](https://img.shields.io/badge/Widget%20Katalo%C4%9Fu-75%20Widget-2FD36B?style=flat-square)](https://github.com/kbudak/Vetra)
+[![Widgets](https://img.shields.io/badge/Widget%20Katalo%C4%9Fu-84%20Widget-2FD36B?style=flat-square)](https://github.com/kbudak/Vetra)
 [![Portable](https://img.shields.io/badge/Kurulum-Tek%20EXE%20%C2%B7%20Ta%C5%9F%C4%B1nabilir-8B5CF6?style=flat-square)](https://github.com/kbudak/Vetra)
 
 </div>
@@ -18,7 +18,7 @@
 
 **Vetra**, Windows’un varsayılan görev çubuğunun yerini alabilen, tamamen yerel **C++20 / Win32 / Direct2D / DirectWrite** ile yazılmış modern bir masaüstü dock’udur. Electron, WebView veya harici bir çalışma zamanı gerektirmez; tek bir taşınabilir `Vetra.exe` (~2,3 MB) olarak çalışır, yönetici izni veya kurulum istemez.
 
-Sadece uygulama başlatmakla kalmaz; **75 modüler widget**, **yerel Denetim Merkezi**, **HD Gizli Simgeler ve panel içi sağ tık menüsü**, **evrensel Windows Atlama Listeleri (Jump Lists)**, **canlı CPU/RAM/sıcaklık telemetrisi** ve **yapay zekâ kota takibi** ile masaüstünü tek bir akıcı şeritte toplar.
+Sadece uygulama başlatmakla kalmaz; **84 modüler widget**, **yerel Denetim Merkezi**, **HD Gizli Simgeler ve panel içi sağ tık menüsü**, **evrensel Windows Atlama Listeleri (Jump Lists)**, **canlı CPU/RAM/sıcaklık telemetrisi** ve **yapay zekâ kota takibi** ile masaüstünü tek bir akıcı şeritte toplar.
 
 ---
 
@@ -47,21 +47,21 @@ Sadece uygulama başlatmakla kalmaz; **75 modüler widget**, **yerel Denetim Mer
   - *Dosya Gezgini:* Sabitlenenler ve Sık kullanılan klasörler
   - *Windows Terminal:* Kurulu tüm kabuk profilleri
   - Alt bölümde **Dock’a sabitle / kaldır**, **Pencereye geç / Uygulamayı aç** ve açık pencereler için **Pencereyi kapat / Tüm pencereleri kapat (N)** yer alır.
-- **Chrome çoklu pencere önizlemesi:** İmleci açık Chrome simgesi üzerinde bekletince küçültülmüş olanlar dahil tüm Chrome pencereleri canlı kartlar hâlinde listelenir.
+- **Tüm uygulamalar için canlı pencere önizlemesi:** İmleci dock üzerindeki herhangi bir açık uygulama simgesinin (Chrome, Netflix, Outlook, Dosya Gezgini, Claude, ChatGPT, Antigravity veya sabitlenmemiş pencereler) üzerinde bekletince küçültülmüş olanlar dahil tüm pencereleri canlı önizleme kartları ve kart üzeri kapatma (`×`) düğmesiyle listelenir; uygulamalar arasında gezerken önizleme gecikmesiz geçiş yapar. Küçültülen pencereler son yakalanan önizlemeyi önbellekten korur; tek pencereli uygulamalara tıklamak anında odak/küçültme yapar, çok pencereli uygulamalarda seçim panelini açar. Chrome pencereleri açılma sırasına göre soldan sağa dizilir.
 
 ### Yerel Denetim Merkezi, Windows Durum Alanı ve Sıfır Titremeli Gizli Simgeler
-- **Windows Durum Alanı:** Dock’un sağ ucunda `^` (Gizli simgeler) ile `|` (Masaüstünü göster) arasında Windows görev çubuğu tarzında bütünleşik bir durum şeridi yer alır ve **Ayarlar → Durum alanı** sekmesinden tüm öğeleri tek tek açılıp kapatılabilir:
+- **Windows Durum Alanı:** Mikrofon, klavye dili, ağ, ses, pil, saat/tarih ve bildirim zili ayrı dock öğeleridir. Göstergeler, Gizli simgeler, Denetim Merkezi ve Masaüstü şeridi dock’un ortak yüzeyinde çizilir. **Dock’u düzenle** modunda bunları widget’ların ve uygulamaların arasına sürükleyebilir, kırmızı **−** ile kaldırabilir, **+ → Widget kataloğu** ile yeniden ekleyebilirsin. **Ayarlar → Durum alanı** sekmesindeki anahtarlar etkin profildeki aynı öğeleri yönetir.
   - **Mikrofon göstergesi:** Bir uygulama mikrofonu aktif kullandığında canlı turkuaz renge ve nokta işaretine döner, susturulduğunda kırmızı çarpılı simge gösterir. Sol tık **Mikrofon** panelini (aktif kayıt yapan uygulama adı, hızlı susturma, giriş aygıtı seçici ve gizlilik/ses ayarları), sağ tık anlık susturmayı çalıştırır. İsteğe bağlı olarak **yalnızca kullanımda göster** modu açılabilir.
   - **Klavye dili (`TR`, `EN` vb.):** Etkin pencerenin klavye düzenini canlı takip eder (aynı dilde birden fazla düzen varsa `Q`/`F`/`US` alt etiketiyle). Sol tık yüklü düzenleri listeleyen **Klavye dili** seçici panelini açar; sağ tık veya fare tekerleği bir sonraki düzene anında geçer.
   - **İnternet bağlantısı, Ses ve Pil:** Keskinleştirilmiş Ethernet (kablolu monitör/fiş), Wi-Fi, uçak modu veya çevrimdışı durum simgesi tıklanınca yalnızca **İnternet** panelini (Ethernet durumu, Wi-Fi anahtarı ve yakındaki/kayıtlı ağlar); ses simgesi tıklanınca yalnızca **Ses** panelini (canlı sürüklenebilir/tekerlekli ses kaydırıcısı ve çıkış aygıtı seçici; sağ tık susturma, dock üzerinde fare tekerleğiyle ±%4 ses ayarı); pil simgesi tıklanınca **Pil ve güç** panelini açar.
   - **Saat, tarih ve yerel Bildirim Merkezi:** İki satırlı Windows saat/tarih bloğu ve canlı rozetli bildirim zil düğmesi tıklanınca Windows’un kendi paneli yerine **Vetra’nın yerel Bildirim Merkezi** açılır: canlı Windows bildirimleri (`wpndatabase.db` + uygulama simgeleri, tek tek kapatma ve **Tümünü temizle**), **Rahatsız Etmeyin** modu anahtarı (`WNF`), daraltılabilir **Mini Takvim** ve doğrudan Vetra Pomodoro motoruna bağlı **Odaklanma** oturumu (`− / + / ▶ Odaklanma`). Sağ tık ilgili Windows ayarlarını açar.
 - **Denetim Merkezi:** Dock’a bitişik iki sayfalı panelde **Wi-Fi** (canlı ağ taraması ve kayıtlı profiller), **Bluetooth** (A2DP Stereo + HFP `ContainerId` eşleştirmeli doğrudan ses bağlantısı ve varsayılan çıkış geçişi), **Uçak modu**, **Enerji tasarrufu**, **Gece ışığı**, **Mobil etkin nokta**, **Yansıt** (çoklu ekran düzenleri), **Erişilebilirlik** (7 yerel anahtar), **Yakın paylaşım**, **Ses çıkışı seçici** ve **canlı Medya kartı** (Windows SMTC oynat/duraklat, ileri/geri veya ±10 sn sarma) tek panelde çalışır.
-- **Gizli simgeler (`^`):** Yüksek çözünürlüklü 5 sütunlu ızgara (`NotifyIconSettings` PNG, MSIX ve `.exe` kaynakları). Sağ tık, taşma penceresini ve açılan yerel menüyü ekranda titreme oluşturmadan gizlice yakalayıp (`#32768`, çok seviyeli alt menüler, WinUI 3, Electron, WebView2, WPF, Qt) doğrudan Vetra temasında gösterir ve komutu gerçek uygulamada çalıştırır.
-- **Masaüstünü göster (`|`):** Dock’un en sağ ucundaki ince şerit tüm açık pencereleri aşağı alır veya geri getirir.
+- **Gizli simgeler (`^`):** Yüksek çözünürlüklü, simge sayısına göre dinamik genişleyen ızgara (`NotifyIconSettings` PNG, MSIX ve `.exe` kaynakları); hem taşma penceresindeki (kaydırılabilir satırlar dahil) hem de Windows görev çubuğuna sabitlenmiş tüm bildirim simgelerini birlikte toplar. Sağ tık, taşma penceresini ekran dışından tetikleyip açılan yerel menüyü (`#32768`, çok seviyeli alt menüler, WinUI 3, Electron, WebView2, WPF, Qt) görünmez biçimde yakalayıp kapandıktan sonra serbest bırakır ve komutu Vetra temasında çalıştırır.
+- **Masaüstünü göster (`|`):** Katalogdaki **Masaüstü şeridi** tüm açık pencereleri aşağı alır veya geri getirir. **Gizli simgeler** düğmesiyle birlikte dock’ta taşınabilir, kaldırılabilir ve yeniden eklenebilir.
 
 ---
 
-## 75 Widget’lık Katalog ve Profiller
+## 84 Widget’lık Katalog ve Profiller
 
 Her widget her profilde kullanılabilir; **Geliştirici**, **Satıcı**, **Kurucu** ve **Öğrenci** profilleri farklı düzen ve görev/not setlerini saklar.
 
@@ -108,16 +108,17 @@ Derleme `build\Vetra.exe` dosyasını üretir ve varsayılan olarak uygulamayı 
 | **V simgesinden veya dikey dışarı sürükleme** | Dock’u üst/alt kenara ve sol/orta/sağ hizalamaya taşır |
 | **Fare tekerleği** | Ses/Cam tonu kaydırıcılarını, durum alanı ses simgesini ve klavye dilini ayarlar; Katalog, Jump List, Chrome önizlemeleri ve listeleri kaydırır |
 | **Tab / Enter / Esc / F5** | Açık panelde gezinir, seçer, kapatır / üst menüye döner; Gizli simgeler ve Chrome önizlemelerinde yeniler |
-| **`^`, Durum alanı ve `\|` (sağ uç)** | Gizli bildirim simgelerini açar / mikrofon, klavye dili, ağ, ses, pil, saat ve bildirimleri yönetir / Masaüstünü gösterir |
+| **`^`, Durum alanı ve `\|`** | Gizli bildirim simgelerini açar / mikrofon, klavye dili, ağ, ses, pil, saat ve bildirimleri yönetir / Masaüstünü gösterir |
 
 ---
 
 ## Yapay Zekâ Kota Beslemesi ve İsteğe Bağlı API Anahtarları
 
 - **Otomatik yerel kaynaklar:**
+  - **Claude:** Claude Desktop kullanım geçmişi (`plan-usage-history.json`, MSIX ve masaüstü kurulumları, 5 sn `mtime` kontrollü), Claude Code OAuth kullanım API’si (`~/.claude/.credentials.json` geçerliyse `api.anthropic.com/api/oauth/usage`, 5 dk + 429 geri çekilmesi) ve yerel `~/.claude/projects` token yedeği.
   - **ChatGPT / Codex:** Resmi `codex app-server` JSON-RPC arayüzü (60 sn) + `~/.codex/sessions` yerel yedeği.
   - **Antigravity / Gemini:** `%LOCALAPPDATA%\agy\bin` veya `PATH` üzerindeki `agy --print /usage --output-format json` (60 sn) + `~/.gemini/tmp`.
-  - **Claude & OpenCode:** Etkin olduklarında `~/.claude/projects` ve `~/.local/share/opencode/opencode.db` (`mtime` kontrollü).
+  - **OpenCode:** Etkin olduğunda `~/.local/share/opencode/opencode.db` (`mtime` kontrollü).
 - **Harici JSON beslemesi (`%LOCALAPPDATA%\Vetra\ai_usage.json`):** Herhangi bir betik veya araç bu dosyayı güncellediğinde ilgili kartlar 5 saniye içinde yenilenir (`p1..3` veya `0..1` aralığında `remainingFraction1..3`, `label1..3`, Unix veya ISO-8601 `r1At..3`):
   ```json
   {
@@ -164,7 +165,18 @@ Derleme `build\Vetra.exe` dosyasını üretir ve varsayılan olarak uygulamayı 
 
 ## Değişiklik geçmişi
 
+### 2026-11-26
+- **Tüm uygulamalar için hover pencere önizlemesi:** Canlı pencere önizleme sistemi yalnızca Chrome yerine dock üzerindeki tüm açık uygulamalara (Netflix, Outlook, Dosya Gezgini, Claude, ChatGPT, Antigravity ve sabitlenmemiş tüm pencereler) genelleştirildi. Önizleme açıkken başka bir açık uygulamanın üzerine gelindiğinde beklemeden anında o uygulamaya geçer; yakalanan önizlemeler önbellekte tutularak küçültülmüş pencerelerde de gösterilir, koyu arayüzlü ve UWP/Win32 pencereler için çift aşamalı `PrintWindow` + şık simge yedeği kullanılır ve her önizleme kartına pencere kapatma (`×`) düğmesi eklendi.
+- **Hızlı pencere küçültme ve pencere boyutu koruma:** Dock üzerindeki etkin bir uygulamaya tekrar tıklandığında gecikmeli `ShowWindowAsync(SW_MINIMIZE)` yerine doğrudan `WM_SYSCOMMAND (SC_MINIMIZE)` ile anında küçültülür ve dock etkin göstergesi beklemeden güncellenir (UWP/sahip olunan pencereler ve tek pencereli Chrome doğrudan tıklama geçişi dahil). Küçültülmüş pencereleri geri getirirken `ShowWindow(SW_RESTORE)` ve `SwitchToThisWindow` kaynaklı Snap/boyut bozulmaları giderildi: artık `WM_SYSCOMMAND (SC_RESTORE)` kullanılır, küçültme öncesi konum/boyut doğrulama korumasıyla Chrome ve diğer uygulamalar açıldıkları boyutta kalır, odak yedeği ise pencere boyutuna dokunmadan (`SWP_NOMOVE | SWP_NOSIZE`) çalışır.
+- **AI Limitleri tek kartta üçlü görünüm ve Claude canlı takibi:** **AI Limitleri** kartına ve paneline **Claude + Codex + Antigravity** (üçü birlikte) modu eklendi ve varsayılan yapıldı (`dock.dat` içinde `aiPair` satırında saklanır); kullanıcı panelden dilediği zaman ikili görünümlere veya **Diğer planlar** seçimine dönebilir. Claude kartları (AI Limitleri ikili/üçlü, Claude Kullanımı ve Claude Plan) artık yerel token sayacı (`0 t`) yerine Codex ile aynı biçimde kalan yüzde ve renkli ilerleme çubuğu gösterir; Claude Desktop’ın `plan-usage-history.json` (MSIX ve standart kurulumlar, 5 sn `mtime` kontrollü) dosyası ile geçerli oturum varsa Claude Code OAuth kullanım uç noktası (`api.anthropic.com/api/oauth/usage`, 429 geri çekilmeli) otomatik okunur, ikisi de yoksa `~/.claude/projects` token yedeğine düşer.
+- **Gizli simgeler eksiksiz listeleme ve genişleyen ızgara:** Sistem tepsisi yakalaması artık XAML taşma penceresinin yerleşimini bekler, kaydırılabilir taşma satırlarını tarar, boş araç ipuçlu simgeleri kaybetmez ve Windows görev çubuğuna sabitlenmiş bildirim simgelerini de listeye ekler. Sabit 5 sütun / 4 satır sınırı kaldırılarak simge sayısına göre ekran sınırları içinde yatay ve dikey olarak dinamik büyüyen ızgara düzenine geçildi.
+- **Sağ tık yerel menü titremesi giderildi:** Taşma penceresini ekran dışına sabit tutup önce klavye bağlam menüsü (`VK_APPS`) ile tetikleme, açılan yerel menü ve `SysShadow` pencerelerini `EVENT_OBJECT_CREATE`/`SHOW` anında ve kare-altı taramayla `alpha=0` + ekran dışına alma (`WS_EX_NOREDIRECTIONBITMAP` pencereleri dahil), kapatma tamamlanmadan gizlemeyi asla kaldırmama (ertelenmiş geri yükleme) ve geçici görev çubuğu erişimini saydam yapma mekanizmaları eklendi.
+
 ### 2026-11-25
+- **Dock akıcılığı:** Mikrofon durumu ve kayıt oturumları arka planda okunur. Tekrarlanan metin yerleşimleri önbellekte tutulur ve ölçer animasyonları sırasında yalnızca ilgili ölçerin göründüğü dock’lar yeniden çizilir. Sürükle-bırak hedefi tek geçişte hesaplanır.
+- **Dock göstergelerinin görünümü:** Durum simgeleri, **Denetim Merkezi**, **Gizli simgeler** ve **Masaüstü şeridi** doğrudan ortak dock yüzeyinde çizilir. Üzerine gelme ve açık panel durumunda simge rengi değişir.
+- **Chrome önizleme sırası:** Vetra çalışırken açılan Chrome pencereleri açılış sırasına göre sağa eklenir. Öne alınan, küçültülen veya geçici olarak gizlenip dönen pencereler yerlerini korur. Vetra’dan önce açık pencerelerin tam açılış sırası Windows tarafından sağlanmadığı için ilk sıra başlangıç anındaki dizilimden belirlenir.
+- **Taşınabilir durum öğeleri:** Yedi durum göstergesi, **Gizli simgeler** ve **Masaüstü şeridi**, profilde saklanan dokuz ayrı katalog öğesine dönüştürüldü. Mevcut durum alanı anahtarları ve mikrofonun kullanımda görünmesi ayarı eski profillerden aktarılır. Sığmayan etkin öğeler **…** menüsünden açılır.
 - **Windows Durum Alanı dock’a eklendi:** Dock’un sağ ucuna (Gizli simgeler `^` ile Masaüstünü göster `|` arasına) **Mikrofon** (aktif kayıt yapan uygulamayı Core Audio `IAudioSessionManager2` ile canlı algılama ve turkuaz gösterge), **Klavye dili** (`TR`/`EN` canlı takip ve yerel seçici panel), **İnternet bağlantısı** (Ethernet / Wi-Fi / Uçak modu / Çevrimdışı), **Ses seviyesi** (sağ tık susturma + fare tekerleği), **Pil ve şarj durumu** (canlı yeşil şarj simgesi ve pil yoksa otomatik gizleme), **Saat ve tarih** (iki satırlı Windows biçimi) ve **Bildirimler** (`Win + N`) eklendi.
 - **Geliştirilmiş Mikrofon ve yeni Klavye dili panelleri:** Mikrofon paneline aktif kayıt yapan uygulama bilgisi, giriş aygıtı (`eCapture`) seçici ve Windows mikrofon gizlilik ayarları kısayolu; Klavye dili paneline yüklü Windows klavye düzenleri listesi ve tek tık geçiş eklendi.
 - **Ayarlar → Durum alanı sekmesi:** Durum alanının genel anahtarı, tüm öğelerin tek tek açılıp kapatılması ve **Mikrofonu yalnızca kullanımda göster** seçeneği eklenip `dock.dat` içine kalıcı olarak bağlandı.

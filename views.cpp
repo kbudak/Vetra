@@ -10,7 +10,8 @@ static constexpr Glyph Glyphs[] = {
     Timer, Chip, Layers, Sun, DateIcon, Activity, ScreenIcon,
     Activity, Trend, Activity, Branch, Trend, Chip, Globe,
     Activity, Activity, Activity, Activity, Activity, Activity, Terminal, Terminal, Activity, Layers, Activity,
-    Activity, Link, Refresh, Music, PlaySolid, Activity, MicIcon, Sliders
+    Activity, Link, Refresh, Music, PlaySolid, Activity, MicIcon, Sliders,
+    ChevronUp, MicIcon, KeyboardIcon, EthernetIcon, Speaker, Battery, Timer, BellIcon, ScreenIcon
 };
 static_assert(ARRAYSIZE(Glyphs) == WidgetCount);
 static constexpr Glyph ProfileIcons[] = {Terminal, Bag, Trend, Document};
@@ -237,7 +238,7 @@ void Dock::paintBarView(View& view, const std::vector<OrderItem>& overflow, cons
     }
     if (!overflow.empty()) {
         const auto b = box(x, Design::DockInset, Design::CardHeight - 6, Design::CardHeight);
-        hit(view, b, [this] { openOverflow(); });
+        hit(view, b, [this, anchor = x + Design::CardHeight / 2.f] { openOverflow(anchor); });
         const float hot = view.hoverAmount();
         if (p.glass) {
             d.fill(b, Design::Radius, tint(p.theme == LiquidGlass ? 0x08090B : p.base, .22f));
@@ -269,62 +270,6 @@ void Dock::paintBarView(View& view, const std::vector<OrderItem>& overflow, cons
         d.fill(doneBox, 10, tint(p.action, 1.f - .18f * doneHot));
         d.icon(Check, inset(doneBox, 9), tint(p.activeInk));
     }
-    if (dockEditMode) x += 82;
-    const auto reveal = box(x, Design::DockInset, Design::TrayWidth, Design::CardHeight);
-    if (p.theme == BareTheme) p.card(d, reveal, Design::Radius);
-    const bool revealActive = active && panel && page == SystemTray;
-    hit(view, reveal, [this, rx = x + Design::TrayWidth / 2.f] { showSystemTray(rx); });
-    const float revealHot = view.hoverAmount();
-    const float revealDown = view.pressAmount();
-    if (p.glass) {
-        const float tone = p.opacity / 100.f;
-        const float fillAlpha = p.theme == LiquidGlass ? (.18f + tone * .22f) : .26f;
-        d.fill(reveal, Design::Radius, tint(p.theme == LiquidGlass ? 0x08090B : p.base, fillAlpha));
-        if (revealActive || revealHot > 0)
-            d.fill(reveal, Design::Radius, tint(0xFFFFFF, .05f * (revealActive ? 1.f : revealHot)));
-        d.glassRim(reveal, Design::Radius, revealActive ? .44f : (.28f + .14f * revealHot));
-    } else if (revealActive || revealHot > 0) {
-        d.outline(inset(reveal, 2), Design::Radius - 2, tint(p.accent, revealActive ? .7f : .45f * revealHot));
-    }
-    const Glyph revealGlyph = revealActive ? (model.edge == 0 ? ChevronDown : ChevronUp)
-        : (model.edge == 0 ? ChevronUp : ChevronDown);
-    const float chevOff = revealDown > 0 ? 1.2f * revealDown : (-1.f * revealHot);
-    d.icon(revealGlyph, box(reveal.left + (Design::TrayWidth - 16.f) / 2.f,
-        reveal.top + (Design::CardHeight - 16.f) / 2.f + chevOff, 16.f, 16.f),
-        tint(revealActive ? p.accent : p.ink, .86f));
-
-    // Windows-style System Status Area (Microphone, Keyboard Language, Network, Volume, Battery, Clock, Notifications)
-    x += Design::TrayWidth;
-    const float sbWidth = statusBarWidth();
-    if (sbWidth > 0.f) {
-        x += Design::StatusBarGap;
-        drawStatusBar(view, x, p);
-        x += sbWidth;
-    }
-
-    // Windows-style Show Desktop sliver at the far right end of the dock
-    x += Design::DesktopStripGap;
-    const auto desk = box(x, Design::DockInset, Design::DesktopStripWidth, Design::CardHeight);
-    if (p.theme == BareTheme) p.card(d, desk, 9.f);
-    hit(view, desk, [this] { toggleDesktop(); });
-    const float deskHot = view.hoverAmount();
-    const float deskDown = view.pressAmount();
-    if (p.glass) {
-        const float tone = p.opacity / 100.f;
-        const float fillAlpha = p.theme == LiquidGlass ? (.18f + tone * .22f) : .26f;
-        d.fill(desk, 9.f, tint(p.theme == LiquidGlass ? 0x08090B : p.base, fillAlpha));
-        if (deskHot > 0) d.fill(desk, 9.f, tint(0xFFFFFF, (.07f + .05f * deskDown) * deskHot));
-        d.glassRim(desk, 9.f, .28f + .18f * deskHot);
-    } else if (deskHot > 0) {
-        d.fill(inset(desk, 1.f), 8.f, tint(p.ink, (.08f + .05f * deskDown) * deskHot));
-        d.outline(inset(desk, 1.5f), 7.5f, tint(p.accent, .48f * deskHot));
-    }
-    const float lineX = desk.left + Design::DesktopStripWidth / 2.f;
-    const float lineHalf = 11.f + 2.5f * deskHot - 1.5f * deskDown;
-    const float lineCy = desk.top + Design::CardHeight / 2.f;
-    d.line(lineX, lineCy - lineHalf, lineX, lineCy + lineHalf,
-        tint(deskHot > 0.25f ? (p.light ? p.action : 0xFFFFFF) : p.ink, .40f + .48f * deskHot),
-        1.5f + .3f * deskHot);
     if (!notice.empty() && !panel && view.w > 250) {
         float nAlpha = 1.f;
         if (motionEnabled()) {
@@ -522,7 +467,10 @@ void Dock::overflowPanel(Palette p) {
         const auto row = box(24, y, sheet.w - 48, 36);
         if (item.kind == OrderKind::Widget) {
             const int id = item.index;
-            hit(sheet, row, [this, id] { open(id); });
+            hit(sheet, row, [this, id] {
+                if (dockControlWidget(id)) activateDockControl(id);
+                else open(id);
+            });
             drawRowBg(row, sheet.hoverAmount());
             d.icon(Glyphs[id], box(36, y + 9, 18, 18), tint(p.accent));
             d.text(Widgets[id].title, box(65, y, sheet.w - 129, 36), Body, tint(p.ink));
@@ -671,15 +619,14 @@ void Dock::systemTray(Palette p) {
         return;
     }
 
-    constexpr int maxVisibleRows = 4;
+    const auto grid = trayGridLayout();
     constexpr float tile = Design::TrayTileSize, gap = Design::TrayTileGap, gridY = Design::TrayGridPadY;
-    const int cols = count < 5 ? count : 5;
+    const int cols = grid.cols;
     const float gridW = cols * tile + (cols - 1) * gap;
     const float gridX = (sheet.w - gridW) / 2.f;
-    const int totalRows = (count + cols - 1) / cols;
-    const int maxOffset = std::max(0, totalRows - maxVisibleRows);
+    const int maxOffset = grid.maxOffset;
     listOffset = std::clamp(listOffset, 0, maxOffset);
-    const int visibleRows = std::min(maxVisibleRows, totalRows);
+    const int visibleRows = grid.visibleRows;
 
     int hoveredItem = -1;
     for (int row = 0; row < visibleRows; ++row) {
@@ -1231,7 +1178,7 @@ void Dock::studio(Palette p) {
         const auto masterCard = box(content, 88, right - content, 54);
         p.card(d, masterCard, 16);
         d.text(L"Windows durum alanını göster", box(content + 16, 94, right - content - 100, 22), Strong, tint(p.ink));
-        d.text(L"Ağ, mikrofon, klavye dili, ses, pil, saat ve bildirimleri dock’un sağ ucunda göster",
+        d.text(L"Etkin profilde ekli olan durum göstergelerini göster",
             box(content + 16, 116, right - content - 100, 18), Caption, tint(p.muted));
         knob(p, box(right - 60, 103, 43, 24), sb.enabled, [this] {
             model.statusBar.enabled = !model.statusBar.enabled;
@@ -1239,38 +1186,41 @@ void Dock::studio(Palette p) {
             changed(true);
         });
 
-        struct StatusRow { Glyph icon; const wchar_t* title; const wchar_t* desc; bool* value; bool sub; };
+        struct StatusRow { Glyph icon; const wchar_t* title; const wchar_t* desc; int widget; };
         StatusRow rows[] = {
-            {MicIcon, L"Mikrofon göstergesi", L"Aktif kayıt rengi, hızlı susturma (sağ tık) ve giriş seçici", &sb.microphone, false},
-            {MicIcon, L"Mikrofonu yalnızca kullanımda göster", L"Bir uygulama mikrofonu kullandığında veya susturulduğunda görünür", &sb.micOnlyInUse, true},
-            {KeyboardIcon, L"Klavye dili", L"Aktif klavye düzeni (TR/EN), tek tık seçici ve sağ tık/tekerlek geçişi", &sb.keyboard, false},
-            {EthernetIcon, L"İnternet bağlantısı", L"Ethernet/Wi-Fi simgesi ve özel İnternet paneli", &sb.network, false},
-            {Speaker, L"Ses seviyesi", L"Özel Ses & çıkış aygıtı paneli, sağ tık susturma ve tekerlek ayarı", &sb.volume, false},
-            {Battery, L"Pil ve şarj durumu", L"Doluluk ve şarj simgesi (pil algılanmazsa otomatik gizlenir)", &sb.battery, false},
-            {Timer, L"Saat ve tarih", L"İki satırlı saat/tarih (tıklayınca Vetra Bildirim & Takvim panelini açar)", &sb.clock, false},
-            {BellIcon, L"Bildirimler", L"Vetra yerel Bildirim Merkezi, Rahatsız Etmeyin, Takvim ve Odaklanma paneli", &sb.notifications, false},
+            {MicIcon, L"Mikrofon göstergesi", L"Aktif kayıt rengi, hızlı susturma (sağ tık) ve giriş seçici", StatusMic},
+            {MicIcon, L"Mikrofonu yalnızca kullanımda göster", L"Bir uygulama mikrofonu kullandığında veya susturulduğunda görünür", -1},
+            {KeyboardIcon, L"Klavye dili", L"Aktif klavye düzeni (TR/EN), tek tık seçici ve sağ tık/tekerlek geçişi", StatusKeyboard},
+            {EthernetIcon, L"İnternet bağlantısı", L"Ethernet/Wi-Fi simgesi ve özel İnternet paneli", StatusNetwork},
+            {Speaker, L"Ses seviyesi", L"Özel Ses & çıkış aygıtı paneli, sağ tık susturma ve tekerlek ayarı", StatusVolume},
+            {Battery, L"Pil ve şarj durumu", L"Doluluk ve şarj simgesi (pil algılanmazsa otomatik gizlenir)", StatusBattery},
+            {Timer, L"Saat ve tarih", L"İki satırlı saat/tarih (tıklayınca Vetra Bildirim & Takvim panelini açar)", StatusClock},
+            {BellIcon, L"Bildirimler", L"Vetra yerel Bildirim Merkezi, Rahatsız Etmeyin, Takvim ve Odaklanma paneli", StatusNotifications},
         };
         const float rowAlpha = sb.enabled ? 1.f : .45f;
         for (int i = 0; i < static_cast<int>(ARRAYSIZE(rows)); ++i) {
             const auto& r = rows[i];
             const float y = 152.f + i * 50.f;
-            const float leftPad = r.sub ? 22.f : 0.f;
+            const bool sub = r.widget < 0;
+            const float leftPad = sub ? 22.f : 0.f;
             const Box card = box(content + leftPad, y, right - content - leftPad, 44);
             p.card(d, card, 13);
-            const float alpha = (sb.enabled && (!r.sub || sb.microphone)) ? 1.f : .42f;
-            if (!r.sub) {
+            const float alpha = (sb.enabled && (!sub || shown(StatusMic))) ? 1.f : .42f;
+            if (!sub) {
                 d.fill(box(card.left + 11, y + 9, 26, 26), 8, tint(p.accent, .14f * alpha));
                 d.icon(r.icon, box(card.left + 16, y + 14, 16, 16), tint(p.ink, .88f * alpha));
             }
-            const float textX = card.left + (r.sub ? 15.f : 46.f);
+            const float textX = card.left + (sub ? 15.f : 46.f);
             d.text(r.title, box(textX, y + 5, card.right - textX - 68.f, 18), TileLabel, tint(p.ink, alpha));
             d.text(r.desc, box(textX, y + 23, card.right - textX - 68.f, 16), Small, tint(p.muted, alpha));
-            knob(p, box(right - 60, y + 10, 43, 24), *r.value, [this, ptr = r.value] {
-                *ptr = !*ptr;
-                if (!model.statusBar.enabled && *ptr) model.statusBar.enabled = true;
-                sampleExtras(true);
-                changed(true);
-            });
+            knob(p, box(right - 60, y + 10, 43, 24),
+                sub ? sb.micOnlyInUse : shown(r.widget), [this, widget = r.widget] {
+                    if (widget >= 0) toggleTile(widget);
+                    else {
+                        model.statusBar.micOnlyInUse = !model.statusBar.micOnlyInUse;
+                        changed(true);
+                    }
+                });
         }
         d.text(L"İpucu: Durum alanındaki simgelere sağ tıklayarak susturma, düzen değiştirme veya Windows ayarlarını açabilirsin.",
             box(content, 560, right - content, 24), Small, tint(p.muted, rowAlpha));

@@ -10,6 +10,8 @@ namespace {
 constexpr wchar_t Property[] = L"Vetra.HiddenTaskbar.v1";
 constexpr wchar_t OrigStateProperty[] = L"Vetra.OrigTaskbarState.v1";
 constexpr wchar_t SecondaryLayerProperty[] = L"Vetra.LayeredTaskbar.v1";
+constexpr wchar_t PrimaryLayerProperty[] = L"Vetra.PrimaryLayer.v1";
+constexpr wchar_t PrimaryRgnProperty[] = L"Vetra.PrimaryRgn.v1";
 constexpr wchar_t LegacyProperty[] = L"PrismDock.HiddenTaskbar.v1";
 constexpr wchar_t RestoreMode[] = L"--restore-taskbar";
 
@@ -121,6 +123,41 @@ void hideSecondarySurface(HWND window, HANDLE owner) {
     }
 }
 
+void hidePrimarySurface(HWND window, HANDLE owner) {
+    wchar_t name[40]{};
+    if (!GetClassNameW(window, name, ARRAYSIZE(name)) || wcscmp(name, L"Shell_TrayWnd") != 0) return;
+    if (!GetPropW(window, PrimaryRgnProperty)) {
+        if (HRGN empty = CreateRectRgn(0, 0, 0, 0)) {
+            if (SetWindowRgn(window, empty, FALSE)) SetPropW(window, PrimaryRgnProperty, owner);
+            else DeleteObject(empty);
+        }
+    }
+    const auto style = GetWindowLongPtrW(window, GWL_EXSTYLE);
+    constexpr LONG_PTR kNoRedir = 0x00200000L;
+    const bool ownLayer = GetPropW(window, PrimaryLayerProperty) != nullptr;
+    if ((style & kNoRedir) != 0 || ((style & WS_EX_LAYERED) && !ownLayer)) return;
+    if (!SetPropW(window, PrimaryLayerProperty, owner)) return;
+    if (!(style & WS_EX_LAYERED)) SetWindowLongPtrW(window, GWL_EXSTYLE, style | WS_EX_LAYERED);
+    BYTE alpha{};
+    DWORD flags{};
+    if (GetLayeredWindowAttributes(window, nullptr, &alpha, &flags) && alpha == 0 && (flags & LWA_ALPHA)) return;
+    if (!SetLayeredWindowAttributes(window, 0, 0, LWA_ALPHA)) {
+        SetWindowLongPtrW(window, GWL_EXSTYLE, style & ~WS_EX_LAYERED);
+        RemovePropW(window, PrimaryLayerProperty);
+    }
+}
+
+void restorePrimarySurface(HWND window) {
+    if (RemovePropW(window, PrimaryRgnProperty)) {
+        SetWindowRgn(window, nullptr, TRUE);
+    }
+    if (RemovePropW(window, PrimaryLayerProperty)) {
+        SetLayeredWindowAttributes(window, 0, 255, LWA_ALPHA);
+        const auto style = GetWindowLongPtrW(window, GWL_EXSTYLE);
+        SetWindowLongPtrW(window, GWL_EXSTYLE, style & ~WS_EX_LAYERED);
+    }
+}
+
 BOOL CALLBACK hideBar(HWND window, LPARAM owner) {
     if (!shellBar(window)) return TRUE;
     auto marker = reinterpret_cast<HANDLE>(owner);
@@ -145,6 +182,7 @@ BOOL CALLBACK restoreBar(HWND window, LPARAM owner) {
             const auto style = GetWindowLongPtrW(window, GWL_EXSTYLE);
             SetWindowLongPtrW(window, GWL_EXSTYLE, style & ~WS_EX_LAYERED);
         }
+        restorePrimarySurface(window);
         ShowWindow(window, SW_SHOW);
         ShowWindowAsync(window, SW_SHOW);
         SetWindowPos(window, nullptr, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
@@ -248,10 +286,12 @@ void ShellTaskbar::hide(bool force) const {
     EnumWindows(hideBar, GetCurrentProcessId());
 }
 
-void ShellTaskbar::revealPrimary() const {
+void ShellTaskbar::revealPrimary(bool silent) const {
     const HWND taskbar = FindWindowW(L"Shell_TrayWnd", nullptr);
-    if (guarded && taskbar && GetPropW(taskbar, Property) ==
-        reinterpret_cast<HANDLE>(static_cast<uintptr_t>(GetCurrentProcessId()))) {
+    const HANDLE selfMarker = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(GetCurrentProcessId()));
+    if (guarded && taskbar && GetPropW(taskbar, Property) == selfMarker) {
+        if (silent) hidePrimarySurface(taskbar, selfMarker);
+        else restorePrimarySurface(taskbar);
         ShowWindowAsync(taskbar, SW_SHOWNOACTIVATE);
     }
 }

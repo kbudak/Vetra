@@ -40,7 +40,9 @@ enum Widget {
     AiLimits, StripeChart, ChatGptUsage, GitHubActivity, DataFastChart, Temperature, XProfile,
     ClaudeUsage, ClaudePlanUsage, GeminiUsage, GrokUsage, DeepSeekBalance, GlmUsage,
     OpenCodeUsage, OpenCodePlanUsage, CursorUsage, StartButton, AiLimitsTriple,
-    DayTimeline, WhatsApp, Currency, MediaCompact, MediaMini, MediaBar, MicControl, QuickToggles, WidgetCount,
+    DayTimeline, WhatsApp, Currency, MediaCompact, MediaMini, MediaBar, MicControl, QuickToggles,
+    HiddenTrayControl, StatusMic, StatusKeyboard, StatusNetwork, StatusVolume, StatusBattery, StatusClock,
+    StatusNotifications, DesktopStripControl, WidgetCount,
     Studio = WidgetCount, ContextMenu, SystemTray, AppMenu, Overflow, ChromeWindows, KeyboardLang, NotificationCenter, NetworkPanel
 };
 enum WidgetGroup { Workspace, Productivity, Device, Analytics, WeatherGroup, MarketGroup, AppGroup, AiGroup };
@@ -103,7 +105,7 @@ inline constexpr Info Widgets[] = {
     {L"Ay ilerlemesi", L"Ayın geçen kısmı", 0xAF9AEB, 135, Productivity},
     {L"Yıl ilerlemesi", L"Yılın geçen kısmı", 0xEDAD78, 135, Productivity},
     {L"Masaüstünü göster", L"Pencereler ve masaüstü arasında geçiş", 0x9DA6EB, 57, AppGroup},
-    {L"AI Limitleri", L"Claude, Codex ve Antigravity arasından iki plan seç", 0x2BCB71, 248, AiGroup},
+    {L"AI Limitleri", L"Claude, Codex ve Antigravity planlarını birlikte veya ikili göster", 0x2BCB71, 248, AiGroup},
     {L"Stripe Grafiği", L"Stripe net gelir çizgi grafiği ve değişim yüzdesi", 0x635BFF, 244, Analytics},
     {L"ChatGPT Kullanımı", L"ChatGPT Codex 5 saatlik oturum ve haftalık limitleri", 0x2BCB71, 246, AiGroup},
     {L"GitHub Aktivitesi", L"GitHub katkı ızgarası, günlük/haftalık sayı ve seri", 0x39D353, 236, Analytics},
@@ -129,8 +131,19 @@ inline constexpr Info Widgets[] = {
     {L"Medya Çubuğu", L"Kapak, parça ilerlemesi ve sonraki parça", 0xAD7EE8, 235, Workspace},
     {L"Mikrofon", L"Varsayılan mikrofonu ve ses çıkışını ayrı ayrı sustur", 0x519EFF, 99, Device},
     {L"Hızlı Kontroller", L"Wi-Fi, Bluetooth, mobil erişim noktası ve uçak modu", 0x0F88F9, 232, Device},
+    {L"Gizli simgeler", L"Windows bildirim simgelerinin Vetra menüsü", 0xA6A6B5, 42, AppGroup},
+    {L"Mikrofon göstergesi", L"Mikrofon kullanımı ve giriş aygıtları", 0x45E5D8, 32, Device},
+    {L"Klavye dili", L"Etkin klavye düzeni ve düzen seçici", 0xA6A6B5, 36, Device},
+    {L"İnternet durumu", L"Ethernet, Wi-Fi ve uçak modu göstergesi", 0x0F88F9, 34, Device},
+    {L"Ses göstergesi", L"Ses seviyesi ve çıkış aygıtları", 0x0F88F9, 34, Device},
+    {L"Pil göstergesi", L"Pil doluluğu ve şarj durumu", 0x2BCB71, 34, Device},
+    {L"Saat ve tarih", L"Saat, tarih ve Bildirim Merkezi", 0xA6A6B5, 68, Workspace},
+    {L"Bildirim zili", L"Vetra Bildirim Merkezi", 0x45E5D8, 30, Device},
+    {L"Masaüstü şeridi", L"Masaüstü ile açık pencereler arasında geçiş", 0x9DA6EB, 25, AppGroup},
 };
 static_assert(ARRAYSIZE(Widgets) == WidgetCount);
+inline bool dockControlWidget(int id) { return id >= HiddenTrayControl && id <= DesktopStripControl; }
+inline bool statusWidget(int id) { return id >= StatusMic && id <= StatusNotifications; }
 inline bool mediaWidget(int id) { return id == Media || (id >= MediaCompact && id <= MediaBar); }
 inline bool weatherWidget(int id) { return id == Weather || (id >= WeatherDetails && id <= SunTimes); }
 inline bool marketWidget(int id) { return id >= StockChart && id <= Crypto; }
@@ -182,14 +195,7 @@ enum class DockVisibility { Overlay, Edge, Reserved };
 
 struct StatusBarConfig {
     bool enabled = true;
-    bool microphone = true;
     bool micOnlyInUse = false;
-    bool keyboard = true;
-    bool network = true;
-    bool volume = true;
-    bool battery = true;
-    bool clock = true;
-    bool notifications = true;
 };
 
 struct Model {
@@ -214,6 +220,7 @@ struct Model {
     std::array<Text, 4> stockSymbols{L"TSLA", L"CRM", L"ORCL", L"AAPL"};
     Text cryptoSymbol = L"BTC/USDT";
     int aiLimitFirst = 0, aiLimitSecond = 1;
+    bool aiLimitTriple = true;
     std::array<AiOverride, AiPlanCount> aiOverrides;
     Text githubUser, xHandle;
     long long xFollowers = -1;

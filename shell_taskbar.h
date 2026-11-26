@@ -11,7 +11,7 @@ public:
     bool start(bool deferAutohide = false);
     void applyAutohide();
     void hide(bool force = false) const;
-    void revealPrimary() const;
+    void revealPrimary(bool silent = false) const;
     void restore();
     void restoreIfOrphaned();
     void expandWorkArea(HMONITOR monitor, RECT& work) const;
