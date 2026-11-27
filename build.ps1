@@ -1,4 +1,4 @@
-param(
+﻿param(
     [switch]$NoLaunch
 )
 $ErrorActionPreference = 'Stop'
@@ -39,6 +39,32 @@ $script = Join-Path $buildDir 'compile.cmd'
 Set-Content -LiteralPath $script -Value $batch -Encoding Default
 & cmd.exe /d /c $script
 if ($LASTEXITCODE -ne 0) { throw "Vetra build failed ($LASTEXITCODE)." }
+
+# Keep the Desktop shortcut/icon synced with the latest build\Vetra.exe
+try {
+    $desktop = [Environment]::GetFolderPath('Desktop')
+    $exePath = Join-Path $buildDir 'Vetra.exe'
+    $icoPath = Join-Path $source 'Vetra.ico'
+    if ($desktop -and (Test-Path -LiteralPath $desktop)) {
+        $desktopExe = Join-Path $desktop 'Vetra.exe'
+        if (Test-Path -LiteralPath $desktopExe) {
+            Copy-Item -LiteralPath $exePath -Destination $desktopExe -Force
+        }
+        $desktopLnk = Join-Path $desktop 'Vetra.lnk'
+        $shell = New-Object -ComObject WScript.Shell
+        $shortcut = $shell.CreateShortcut($desktopLnk)
+        $shortcut.TargetPath = $exePath
+        $shortcut.WorkingDirectory = $buildDir
+        if (Test-Path -LiteralPath $icoPath) {
+            $shortcut.IconLocation = "$icoPath,0"
+        } else {
+            $shortcut.IconLocation = "$exePath,0"
+        }
+        $shortcut.Save()
+    }
+} catch {
+    Write-Warning "Masaüstü kısayolu güncellenemedi: $_"
+}
 
 if (-not $NoLaunch) {
     Start-Process -FilePath (Join-Path $buildDir 'Vetra.exe') | Out-Null

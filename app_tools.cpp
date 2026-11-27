@@ -957,7 +957,12 @@ void Dock::closeAppWindows(const std::vector<HWND>& windows) {
 void Dock::showWindowMenu(HWND window, float x) {
     auto found = std::find_if(extra.windows.begin(), extra.windows.end(),
         [window](const OpenWindow& item) { return item.handle == window; });
-    Shortcut app = IsWindow(window) ? windowApp(window) : Shortcut{};
+    Shortcut app;
+    if (found != extra.windows.end() && !found->app.target.empty()) {
+        app = found->app;
+    } else if (IsWindow(window)) {
+        app = windowApp(window);
+    }
     if (found != extra.windows.end()) {
         if (app.target.empty() && !found->app.target.empty()) app = found->app;
         if (app.label.empty()) app.label = found->title;

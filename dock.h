@@ -14,12 +14,14 @@ inline constexpr auto MonitorDockClass = L"Vetra.MonitorDock";
 inline constexpr auto PanelClass = L"Vetra.Panel";
 inline constexpr UINT TrayMessage = WM_APP + 1, ShowStudio = WM_APP + 2, AsyncWake = WM_APP + 3,
     StartupDeferred = WM_APP + 4, LaunchFailedMsg = WM_APP + 5;
+inline constexpr UINT_PTR TraySyncTick = 10;
 inline constexpr UINT_PTR SessionTimerTick = 12;
 inline constexpr UINT_PTR ChromePreviewTick = 13;
 inline constexpr UINT_PTR ChromeHoverTick = 14;
 inline constexpr UINT_PTR InstalledAppsTick = 15;
 inline constexpr UINT_PTR WindowSyncTick = 16;
 inline constexpr UINT_PTR WarmupTick = 17;
+inline constexpr UINT_PTR TrayUncloakTick = 18;
 
 double animNowMs();
 void releaseAudioEndpoint();
@@ -182,7 +184,8 @@ public:
     bool trayMenuLoading = false, trayMenuUnavailable = false;
     int trayActionIndex = -1, trayCaptureTries = 0, trayPopupSeenTries = 0;
     Text trayActionName;
-    POINT trayActionPoint{}, trayLocalOffset{}, trayNativeClick{};
+    Text trayExpectedStem;
+    POINT trayActionPoint{}, trayLocalOffset{}, trayNativeClick{}, traySavedCursor{};
     RECT trayLastOvRect{};
     HWND trayOverflow{};
     HWND trayCapturedMenuHwnd{};
@@ -193,13 +196,14 @@ public:
     std::vector<HWND> trayIgnoredPopups;
     TrayMenuItem trayPendingExec;
     bool trayLoading = false, trayNeedsReveal = false, trayOverflowSettled = false, trayRightClickPending = false;
-    bool trayActionOnTaskbar = false, trayUsedKeyboardMenu = false, trayFallbackMouseSent = false;
+    bool trayActionOnTaskbar = false, trayUsedKeyboardMenu = false, trayFallbackMouseSent = false, trayCursorLocked = false;
     int trayRightClickStep = 0;
-    HWINEVENTHOOK trayHook{};
+    std::array<HWINEVENTHOOK, 3> trayHooks{};
     struct TrayCaptureResult {
         uint64_t generation = 0;
         bool ok = false;
         bool revealedTaskbar = false;
+        bool passiveWarmup = false;
         std::vector<TrayItem> items;
     };
     std::future<TrayCaptureResult> trayCaptureRequest;
@@ -470,8 +474,9 @@ public:
     void finishTrayMenu(bool executed = false);
     const std::vector<TrayMenuItem>& currentTrayMenu() const;
     Text trayMenuTitle() const;
+    float trayMenuSheetWidth() const;
     void updateTraySync();
-    void stopTraySync(bool forceRestore = false);
+    void stopTraySync(bool forceRestore = false, bool preserveExecutedPopup = false);
     void pollDeferredTrayUncloak();
     Design::TrayGridLayout trayGridLayout() const;
     bool trayBusy() const { return trayAction != TrayAction::None; }
@@ -551,6 +556,8 @@ public:
     void sizeChromeWindows(float availableWidth);
     void scrollChromeWindows(int delta);
     void chromeWindowsPanel(Palette p);
+    void syncWindowPreviewOverlays(const POINT* origin = nullptr);
+    void clearWindowPreviewOverlays();
     void backTrayMenu();
     void showWindowMenu(HWND window, float x = -1);
     void loadApps();

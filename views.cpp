@@ -398,6 +398,8 @@ void Dock::paintSheet(const POINT* origin) {
         d.text(notice, inset(b, 6), Body, tint(p.ink, nAlpha), Center);
     }
     d.end(origin);
+    if (page == ChromeWindows) syncWindowPreviewOverlays(origin);
+    else clearWindowPreviewOverlays();
 }
 void Dock::contextMenu(Palette p) {
     auto& d = sheet.d;
@@ -640,13 +642,14 @@ void Dock::systemTray(Palette p) {
             const float pressVal = sheet.pressAmount();
             if (over) hoveredItem = idx;
 
+            const bool activeCell = over || idx == trayMenuIconIndex || idx == trayPendingMenuIndex;
             if (glass) {
-                const float strength = (over || idx == trayMenuIconIndex) ? std::max(.5f, hoverVal) : hoverVal;
+                const float strength = activeCell ? std::max(.5f, hoverVal) : hoverVal;
                 d.fill(b, 10, tint(p.theme == LiquidGlass ? 0x08090B : p.base, .22f));
                 if (strength > 0.f) d.fill(b, 10, tint(p.light ? 0x10141A : 0xFFFFFF, .08f * strength));
                 d.glassRim(b, 10, .24f + .18f * strength);
-            } else if (over || hoverVal > 0.f || idx == trayMenuIconIndex) {
-                const float strength = (over || idx == trayMenuIconIndex) ? std::max(.35f, hoverVal) : hoverVal;
+            } else if (activeCell || hoverVal > 0.f) {
+                const float strength = activeCell ? std::max(.35f, hoverVal) : hoverVal;
                 d.fill(b, 9, tint(p.ink, .16f * strength));
                 d.outline(inset(b, .45f), 8.5f, tint(p.ink, .18f * strength), .85f);
             }

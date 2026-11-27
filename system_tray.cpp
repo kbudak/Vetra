@@ -2,8 +2,10 @@
 #include <UIAutomation.h>
 #include <commctrl.h>
 #include <dwmapi.h>
+#include <mmsystem.h>
 #include <oleacc.h>
 #include <shlobj.h>
+#include <tlhelp32.h>
 #include <wrl/client.h>
 #include <algorithm>
 #include <cmath>
@@ -13,12 +15,33 @@
 #include <queue>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #pragma comment(lib, "oleacc.lib")
 
 namespace {
 using Microsoft::WRL::ComPtr;
+
+struct ScopedHighResTimer {
+    bool active = false;
+    ScopedHighResTimer() noexcept { active = (timeBeginPeriod(1) == TIMERR_NOERROR); }
+    ~ScopedHighResTimer() { if (active) timeEndPeriod(1); }
+    ScopedHighResTimer(const ScopedHighResTimer&) = delete;
+    ScopedHighResTimer& operator=(const ScopedHighResTimer&) = delete;
+};
+
+struct ScopedBackgroundPriority {
+    bool active = false;
+    ScopedBackgroundPriority() noexcept {
+        active = (SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN) != FALSE);
+    }
+    ~ScopedBackgroundPriority() {
+        if (active) SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END);
+    }
+    ScopedBackgroundPriority(const ScopedBackgroundPriority&) = delete;
+    ScopedBackgroundPriority& operator=(const ScopedBackgroundPriority&) = delete;
+};
 
 struct CloakedMenuRecord {
     HWND hwnd{};
@@ -27,6 +50,7 @@ struct CloakedMenuRecord {
     bool changedEx = false;
     bool changedRgn = false;
     bool movedOffscreen = false;
+    bool executed = false;
     ULONGLONG dismissStartedAt = 0;
     int dismissRetries = 0;
 };
@@ -37,8 +61,64 @@ bool gRestoreLayered = false;
 bool gRestoreOverflowRgn = false;
 bool gInTraySync = false;
 LONG_PTR gOrigExStyle = 0;
+std::mutex gCloakMutex;
 std::vector<CloakedMenuRecord> gCloakedMenus;
 std::vector<CloakedMenuRecord> gDeferredUncloakMenus;
+std::mutex gOverflowEventMutex;
+HANDLE gOverflowReadyEvent = nullptr;
+std::mutex gWarmupTrayMutex;
+std::optional<std::vector<TrayItem>> gWarmupTrayItems;
+
+// Dedicated high-priority WinEvent guard thread so overflow/popup cloaking NEVER stalls
+// while the UI thread is inside COM/UIA calls or short wait loops.
+constexpr UINT kGuardMsgStart = WM_APP + 41;
+constexpr UINT kGuardMsgStop = WM_APP + 42;
+std::mutex gGuardLifecycleMutex;
+std::thread gGuardThread;
+DWORD gGuardTid = 0;
+HANDLE gGuardReadyEv = nullptr;
+HANDLE gGuardSyncEv = nullptr;
+std::atomic<bool> gGuardEnabled{false};
+std::atomic<bool> gGuardCloakMenus{false};
+std::atomic<bool> gGuardHideTaskbar{false};
+std::atomic<bool> gGuardLockCursor{false};
+std::atomic<LONG> gGuardCursorX{0};
+std::atomic<LONG> gGuardCursorY{0};
+std::atomic<HWND> gGuardNotifyHwnd{nullptr};
+std::atomic<HWND> gGuardPanelHwnd{nullptr};
+std::atomic<HWND> gGuardDetectedMenu{nullptr};
+std::atomic<HWND> gGuardLastOverflow{nullptr};
+std::atomic<ULONGLONG> gOverflowWatchUntil{0};
+std::mutex gGuardFilterMutex;
+std::unordered_set<HWND> gGuardPreVisible;
+std::unordered_set<HWND> gGuardIgnored;
+Text gGuardExpectedStem;
+DWORD gGuardOwnerPid = 0;
+
+void signalOverflowReadyEvent() {
+    std::lock_guard lock(gOverflowEventMutex);
+    if (gOverflowReadyEvent) SetEvent(gOverflowReadyEvent);
+}
+
+void syncGuardCursorState(const Dock& dock) {
+    gGuardCursorX.store(dock.traySavedCursor.x, std::memory_order_relaxed);
+    gGuardCursorY.store(dock.traySavedCursor.y, std::memory_order_relaxed);
+    gGuardLockCursor.store(dock.trayCursorLocked, std::memory_order_release);
+}
+
+void unlockTrayCursor(Dock& dock) {
+    gGuardLockCursor.store(false, std::memory_order_release);
+    if (dock.trayCursorLocked) {
+        ClipCursor(nullptr);
+        dock.trayCursorLocked = false;
+    }
+    if (dock.traySavedCursor.x != 0 || dock.traySavedCursor.y != 0) {
+        POINT cur{};
+        if (GetCursorPos(&cur) && (cur.x != dock.traySavedCursor.x || cur.y != dock.traySavedCursor.y)) {
+            SetCursorPos(dock.traySavedCursor.x, dock.traySavedCursor.y);
+        }
+    }
+}
 
 Text toLowerText(const wchar_t* text) {
     if (!text || !*text) return {};
@@ -105,26 +185,117 @@ HWND findWin32MenuForHandle(HMENU target, HWND exclude = nullptr) {
     return nullptr;
 }
 
-void moveOverflowOffscreen(HWND overflow) {
-    if (!overflow) return;
+bool isOnAnyMonitor(const RECT& rc);
+
+void moveOverflowOffscreen(HWND overflow, bool async = false) {
+    if (!overflow || !IsWindow(overflow)) return;
     const int offX = GetSystemMetrics(SM_XVIRTUALSCREEN) - 4000;
     const int offY = GetSystemMetrics(SM_YVIRTUALSCREEN) - 4000;
     RECT rc{};
-    if (GetWindowRect(overflow, &rc) && rc.left == offX && rc.top == offY) return;
-    SetWindowPos(overflow, HWND_BOTTOM, offX, offY, 0, 0,
-        SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOSENDCHANGING);
+    if (!GetWindowRect(overflow, &rc) || rc.left != offX || rc.top != offY) {
+        const UINT flags = SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOSENDCHANGING |
+            (async ? SWP_ASYNCWINDOWPOS : 0u);
+        SetWindowPos(overflow, HWND_BOTTOM, offX, offY, 0, 0, flags);
+    }
+    // For legacy non-DComp NotifyIconOverflowWindow, also suppress GDI rendering.
+    const LONG_PTR ex = GetWindowLongPtrW(overflow, GWL_EXSTYLE);
+    constexpr LONG_PTR kNoRedir = 0x00200000L;
+    if ((ex & kNoRedir) == 0) {
+        std::lock_guard lock(gCloakMutex);
+        if (!gRestoreOverflowRgn) {
+            if (HRGN empty = CreateRectRgn(0, 0, 0, 0)) {
+                if (SetWindowRgn(overflow, empty, FALSE)) {
+                    gCloakedOverflow = overflow;
+                    gRestoreOverflowRgn = true;
+                } else {
+                    DeleteObject(empty);
+                }
+            }
+        }
+    }
+}
+
+void forceForegroundWindow(HWND target) {
+    if (!target || !IsWindow(target) || !IsWindowVisible(target)) return;
+    if (GetForegroundWindow() == target) return;
+    AllowSetForegroundWindow(ASFW_ANY);
+    if (SetForegroundWindow(target) && GetForegroundWindow() == target) return;
+    const HWND fg = GetForegroundWindow();
+    const DWORD myTid = GetCurrentThreadId();
+    const DWORD fgTid = fg ? GetWindowThreadProcessId(fg, nullptr) : 0;
+    const DWORD tgtTid = GetWindowThreadProcessId(target, nullptr);
+    bool attFg = false, attTgt = false;
+    if (fgTid && fgTid != myTid) attFg = AttachThreadInput(myTid, fgTid, TRUE) != FALSE;
+    if (tgtTid && tgtTid != myTid && tgtTid != fgTid) attTgt = AttachThreadInput(myTid, tgtTid, TRUE) != FALSE;
+    SetForegroundWindow(target);
+    BringWindowToTop(target);
+    if (attTgt) AttachThreadInput(myTid, tgtTid, FALSE);
+    if (attFg) AttachThreadInput(myTid, fgTid, FALSE);
+}
+
+void dismissOverflowWindow(HWND overflow, HWND foregroundRestore = nullptr) {
+    if (!overflow || !IsWindow(overflow)) return;
+    moveOverflowOffscreen(overflow, false);
+    if (!IsWindowVisible(overflow)) return;
+
+    wchar_t cls[64]{};
+    GetClassNameW(overflow, cls, ARRAYSIZE(cls));
+    const bool isXamlIsland = (wcscmp(cls, L"TopLevelWindowForOverflowXamlIsland") == 0);
+
+    if (!isXamlIsland) {
+        PostMessageW(overflow, WM_CLOSE, 0, 0);
+        ShowWindowAsync(overflow, SW_HIDE);
+        return;
+    }
+
+    // Windows 11's XAML overflow island ignores WM_CLOSE; trigger clean light-dismiss
+    // (Escape + WA_INACTIVE + foreground restore) so Explorer's internal IsOpen resets to false.
+    PostMessageW(overflow, WM_KEYDOWN, VK_ESCAPE, 0x00010001);
+    PostMessageW(overflow, WM_KEYUP, VK_ESCAPE, 0xC0010001);
+    PostMessageW(overflow, WM_ACTIVATE, WA_INACTIVE, 0);
+    if (foregroundRestore && IsWindow(foregroundRestore) && IsWindowVisible(foregroundRestore)) {
+        forceForegroundWindow(foregroundRestore);
+    }
+
+    ScopedHighResTimer hiRes;
+    for (int w = 0; w < 14 && IsWindow(overflow) && IsWindowVisible(overflow); ++w) {
+        moveOverflowOffscreen(overflow, false);
+        Sleep(2);
+    }
+
+    if (IsWindow(overflow) && IsWindowVisible(overflow) && GetForegroundWindow() == overflow) {
+        INPUT esc[2]{};
+        esc[0].type = esc[1].type = INPUT_KEYBOARD;
+        esc[0].ki.wVk = esc[1].ki.wVk = VK_ESCAPE;
+        esc[1].ki.dwFlags = KEYEVENTF_KEYUP;
+        SendInput(ARRAYSIZE(esc), esc, sizeof(INPUT));
+        for (int w = 0; w < 10 && IsWindow(overflow) && IsWindowVisible(overflow); ++w) {
+            moveOverflowOffscreen(overflow, false);
+            Sleep(2);
+        }
+    }
+
+    if (IsWindow(overflow) && IsWindowVisible(overflow)) {
+        moveOverflowOffscreen(overflow, false);
+        PostMessageW(overflow, WM_CLOSE, 0, 0);
+        ShowWindowAsync(overflow, SW_HIDE);
+    }
 }
 
 bool isCloakedMenu(HWND w) {
     if (!w) return false;
+    std::lock_guard lock(gCloakMutex);
     return std::any_of(gCloakedMenus.begin(), gCloakedMenus.end(),
         [w](const CloakedMenuRecord& r) { return r.hwnd == w; });
 }
 
 bool cloakedOrigRect(HWND w, RECT& out) {
+    std::lock_guard lock(gCloakMutex);
     const auto it = std::find_if(gCloakedMenus.begin(), gCloakedMenus.end(),
         [w](const CloakedMenuRecord& r) { return r.hwnd == w && r.movedOffscreen; });
     if (it == gCloakedMenus.end()) return false;
+    if ((it->origRect.right - it->origRect.left) < 16 || (it->origRect.bottom - it->origRect.top) < 12)
+        return false;
     out = it->origRect;
     return true;
 }
@@ -137,8 +308,9 @@ void hideSysShadowWindow(HWND w) {
     ShowWindowAsync(w, SW_HIDE);
 }
 
-void cloakMenuWindow(HWND w) {
+void cloakMenuWindow(HWND w, bool asyncPos = false) {
     if (!w || !IsWindow(w)) return;
+    std::lock_guard lock(gCloakMutex);
     // Remove any stale deferred record for a reused popup HWND before re-cloaking.
     std::erase_if(gDeferredUncloakMenus, [w](const CloakedMenuRecord& r) { return r.hwnd == w; });
 
@@ -179,13 +351,17 @@ void cloakMenuWindow(HWND w) {
     const int offY = GetSystemMetrics(SM_YVIRTUALSCREEN) - 4000;
     RECT curRc{};
     if (GetWindowRect(w, &curRc)) {
-        if ((!rec.movedOffscreen || IsRectEmpty(&rec.origRect)) && !IsRectEmpty(&curRc) &&
+        const bool validCurSize = (curRc.right - curRc.left) >= 16 && (curRc.bottom - curRc.top) >= 12;
+        const bool hasValidOrig = (rec.origRect.right - rec.origRect.left) >= 16 &&
+            (rec.origRect.bottom - rec.origRect.top) >= 12;
+        if ((!rec.movedOffscreen || !hasValidOrig) && validCurSize &&
             (curRc.left != offX || curRc.top != offY)) {
             rec.origRect = curRc;
         }
         if (curRc.left != offX || curRc.top != offY) {
-            if (SetWindowPos(w, HWND_BOTTOM, offX, offY, 0, 0,
-                    SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOSENDCHANGING)) {
+            const UINT flags = SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOSENDCHANGING |
+                (asyncPos ? SWP_ASYNCWINDOWPOS : 0u);
+            if (SetWindowPos(w, HWND_BOTTOM, offX, offY, 0, 0, flags)) {
                 rec.movedOffscreen = true;
             }
         }
@@ -197,9 +373,21 @@ void cloakMenuWindow(HWND w) {
     }
 }
 
+void restoreMenuRegionForClick(HWND w) {
+    if (!w || !IsWindow(w)) return;
+    std::lock_guard lock(gCloakMutex);
+    const auto it = std::find_if(gCloakedMenus.begin(), gCloakedMenus.end(),
+        [w](const CloakedMenuRecord& r) { return r.hwnd == w; });
+    if (it != gCloakedMenus.end() && it->changedRgn) {
+        SetWindowRgn(w, nullptr, FALSE);
+        it->changedRgn = false;
+    }
+}
+
 void applyRestoreCloakedRecord(const CloakedMenuRecord& rec) {
     if (!rec.hwnd || !IsWindow(rec.hwnd)) return;
-    if (rec.movedOffscreen && !IsRectEmpty(&rec.origRect)) {
+    if (rec.movedOffscreen && (rec.origRect.right - rec.origRect.left) >= 16 &&
+        (rec.origRect.bottom - rec.origRect.top) >= 12 && isOnAnyMonitor(rec.origRect)) {
         SetWindowPos(rec.hwnd, nullptr, rec.origRect.left, rec.origRect.top, 0, 0,
             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOSENDCHANGING);
     }
@@ -210,22 +398,34 @@ void applyRestoreCloakedRecord(const CloakedMenuRecord& rec) {
     }
 }
 
-void uncloakMenuWindow(HWND w, bool force = false) {
-    const auto it = std::find_if(gCloakedMenus.begin(), gCloakedMenus.end(),
-        [w](const CloakedMenuRecord& r) { return r.hwnd == w; });
-    if (it == gCloakedMenus.end()) return;
-    CloakedMenuRecord rec = *it;
-    gCloakedMenus.erase(it);
+void uncloakMenuWindow(HWND w, bool force = false, bool executed = false) {
+    CloakedMenuRecord rec{};
+    {
+        std::lock_guard lock(gCloakMutex);
+        const auto it = std::find_if(gCloakedMenus.begin(), gCloakedMenus.end(),
+            [w](const CloakedMenuRecord& r) { return r.hwnd == w; });
+        if (it == gCloakedMenus.end()) return;
+        rec = *it;
+        gCloakedMenus.erase(it);
+    }
     if (!w || !IsWindow(w)) return;
     // Never uncloak a menu window while it is still visible on-screen (causes a flash right before Vetra's UI).
     if (!force && IsWindowVisible(w)) {
+        rec.executed = executed;
         rec.dismissStartedAt = GetTickCount64();
         rec.dismissRetries = 0;
+        std::lock_guard lock(gCloakMutex);
         std::erase_if(gDeferredUncloakMenus, [w](const CloakedMenuRecord& r) { return r.hwnd == w; });
         gDeferredUncloakMenus.push_back(rec);
         return;
     }
     applyRestoreCloakedRecord(rec);
+}
+
+void clearDeferredUncloakFor(HWND w) {
+    if (!w) return;
+    std::lock_guard lock(gCloakMutex);
+    std::erase_if(gDeferredUncloakMenus, [w](const CloakedMenuRecord& r) { return r.hwnd == w; });
 }
 
 ComPtr<IUIAutomation> createUiaClient() {
@@ -310,18 +510,38 @@ bool isOnAnyMonitor(const RECT& rc) {
     return !IsRectEmpty(&rc) && MonitorFromRect(&rc, MONITOR_DEFAULTTONULL) != nullptr;
 }
 
+bool isNearOffscreenAnchor(const RECT& rc) {
+    if (IsRectEmpty(&rc)) return false;
+    const int offX = GetSystemMetrics(SM_XVIRTUALSCREEN) - 4000;
+    const int offY = GetSystemMetrics(SM_YVIRTUALSCREEN) - 4000;
+    return rc.left >= offX - 1200 && rc.left <= offX + 1600 &&
+        rc.top >= offY - 1200 && rc.top <= offY + 1600;
+}
+
 void snapshotTrayPreWindows(Dock& dock) {
     dock.trayPreWindows.clear();
     dock.trayIgnoredPopups.clear();
     dock.trayPreForeground = GetForegroundWindow();
+    std::unordered_set<HWND> preVis;
+    std::pair<std::vector<Dock::TrayWindowSnap>*, std::unordered_set<HWND>*> snapCtx{&dock.trayPreWindows, &preVis};
     EnumWindows([](HWND w, LPARAM lp) -> BOOL {
-        auto* list = reinterpret_cast<std::vector<Dock::TrayWindowSnap>*>(lp);
+        if (!IsWindowVisible(w)) return TRUE;
+        auto* pair = reinterpret_cast<std::pair<std::vector<Dock::TrayWindowSnap>*, std::unordered_set<HWND>*>*>(lp);
+        if (isWindowCloakedByDwm(w) || isWindowTransparentAlpha(w)) return TRUE;
         RECT rc{};
         GetWindowRect(w, &rc);
-        const bool vis = IsWindowVisible(w) != FALSE && !isWindowCloakedByDwm(w) && !isWindowTransparentAlpha(w);
-        list->push_back({w, vis, rc});
+        pair->first->push_back({w, true, rc});
+        pair->second->insert(w);
         return TRUE;
-    }, reinterpret_cast<LPARAM>(&dock.trayPreWindows));
+    }, reinterpret_cast<LPARAM>(&snapCtx));
+    {
+        std::lock_guard lock(gGuardFilterMutex);
+        gGuardPreVisible = std::move(preVis);
+        gGuardIgnored.clear();
+        gGuardExpectedStem = dock.trayExpectedStem;
+        gGuardOwnerPid = dock.trayMenuOwnerPid;
+    }
+    gGuardDetectedMenu.store(nullptr, std::memory_order_release);
 }
 
 bool isExcludedSystemWindow(HWND w, const Dock& dock, wchar_t (&cls)[96], DWORD& outPid) {
@@ -354,6 +574,51 @@ bool isExcludedSystemWindow(HWND w, const Dock& dock, wchar_t (&cls)[96], DWORD&
     return false;
 }
 
+Text cachedProcessStemLower(DWORD pid) {
+    if (!pid) return {};
+    static std::mutex pidMutex;
+    static std::unordered_map<DWORD, Text> pidCache;
+    {
+        std::lock_guard lock(pidMutex);
+        if (const auto it = pidCache.find(pid); it != pidCache.end()) return it->second;
+    }
+    Text stem;
+    if (const HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid)) {
+        wchar_t path[1024]{};
+        DWORD len = ARRAYSIZE(path);
+        if (QueryFullProcessImageNameW(proc, 0, path, &len) && len > 0) {
+            const Text full(path, len);
+            const size_t slash = full.find_last_of(L"\\/");
+            const size_t start = (slash == Text::npos) ? 0 : slash + 1;
+            const size_t dot = full.find_last_of(L'.');
+            const size_t end = (dot != Text::npos && dot > start) ? dot : full.size();
+            stem = toLowerText(full.substr(start, end - start).c_str());
+        }
+        CloseHandle(proc);
+    }
+    if (!stem.empty()) {
+        std::lock_guard lock(pidMutex);
+        if (pidCache.size() > 192) pidCache.clear();
+        pidCache[pid] = stem;
+    }
+    return stem;
+}
+
+bool stemMatchesExpected(const Text& winStem, const Text& expectedStem) {
+    if (winStem.empty() || expectedStem.empty()) return false;
+    if (winStem == expectedStem) return true;
+    auto basePrefix = [](const Text& s) {
+        size_t cut = s.find_first_of(L"._- ");
+        return (cut != Text::npos && cut >= 4) ? s.substr(0, cut) : s;
+    };
+    const Text wb = basePrefix(winStem);
+    const Text eb = basePrefix(expectedStem);
+    if (wb.size() >= 4 && wb == eb) return true;
+    if (expectedStem.size() >= 5 && winStem.find(expectedStem) != Text::npos) return true;
+    if (winStem.size() >= 5 && expectedStem.find(winStem) != Text::npos) return true;
+    return false;
+}
+
 int scoreTrayPopup(const Dock& dock, HWND w, bool fromShowEvent = false) {
     if (!w || !IsWindow(w) || !IsWindowVisible(w) || isWindowCloakedByDwm(w)) return -1;
     if (std::find(dock.trayIgnoredPopups.begin(), dock.trayIgnoredPopups.end(), w) != dock.trayIgnoredPopups.end())
@@ -367,16 +632,22 @@ int scoreTrayPopup(const Dock& dock, HWND w, bool fromShowEvent = false) {
     if (!GetWindowRect(w, &rc)) return -1;
     const bool cloaked = isCloakedMenu(w);
     RECT logicalRc = rc;
-    if (cloaked) cloakedOrigRect(w, logicalRc);
-    if (!cloaked && !isOnAnyMonitor(rc)) return -1;
+    const bool hasOrigRect = cloaked && cloakedOrigRect(w, logicalRc);
+    // Apps triggered from an offscreen overflow window often open their popup near (-4000, -4000);
+    // allow those offscreen rects while still rejecting parked/minimized (-32000, -32000) windows.
+    const bool validGeo = cloaked || isOnAnyMonitor(rc) || isNearOffscreenAnchor(rc);
+    if (!validGeo) return -1;
     const int rw = logicalRc.right - logicalRc.left, rh = logicalRc.bottom - logicalRc.top;
-    if (rw < 36 || rh < 16 || rw > 1280 || rh > 1100) return -1;
+    if (rw < 32 || rh < 14 || rw > 1360 || rh > 1160) return -1;
 
     const bool win32Menu = wcscmp(cls, L"#32768") == 0;
     const LONG_PTR style = GetWindowLongPtrW(w, GWL_STYLE);
     const LONG_PTR ex = GetWindowLongPtrW(w, GWL_EXSTYLE);
     const HWND fg = GetForegroundWindow();
     const bool isFg = (w == fg || (fg && GetAncestor(fg, GA_ROOT) == w));
+
+    const Text winStem = (!dock.trayExpectedStem.empty() && winPid) ? cachedProcessStemLower(winPid) : Text{};
+    const bool stemMatch = !dock.trayExpectedStem.empty() && stemMatchesExpected(winStem, dock.trayExpectedStem);
 
     const auto snap = std::find_if(dock.trayPreWindows.begin(), dock.trayPreWindows.end(),
         [w](const Dock::TrayWindowSnap& s) { return s.hwnd == w; });
@@ -388,39 +659,49 @@ int scoreTrayPopup(const Dock& dock, HWND w, bool fromShowEvent = false) {
         const int sw = snap->rect.right - snap->rect.left;
         const int sh = snap->rect.bottom - snap->rect.top;
         const bool wasHiddenGeo = (sw <= 4 || sh <= 4 || !isOnAnyMonitor(snap->rect));
-        movedOnScreen = wasHiddenGeo || (!EqualRect(&snap->rect, &logicalRc) && isFg);
+        movedOnScreen = wasHiddenGeo || (!EqualRect(&snap->rect, &logicalRc) && (isFg || stemMatch));
     }
+    const bool popupLikeClass = wcsncmp(cls, L"WindowsForms10.", 15) == 0 ||
+        wcsncmp(cls, L"HwndWrapper[", 12) == 0 || wcsncmp(cls, L"Qt", 2) == 0 ||
+        wcsncmp(cls, L"Chrome_WidgetWin_", 17) == 0 || wcsncmp(cls, L"WinUIDesktop", 12) == 0 ||
+        wcsncmp(cls, L"Xaml_WindowedPopup", 18) == 0 || wcsncmp(cls, L"vguiPopupWindow", 15) == 0 ||
+        wcsncmp(cls, L"SDL_app", 7) == 0 || wcsstr(cls, L"Popup") != nullptr ||
+        wcsstr(cls, L"Menu") != nullptr || wcsstr(cls, L"Flyout") != nullptr || wcsstr(cls, L"Tray") != nullptr;
+
     const bool newlyFg = isFg && w != dock.trayPreForeground &&
-        (win32Menu || (style & WS_POPUP) != 0 || (ex & (WS_EX_TOPMOST | WS_EX_TOOLWINDOW)) != 0 ||
-         wcsstr(cls, L"WinUI") != nullptr || wcsstr(cls, L"Popup") != nullptr ||
-         wcsstr(cls, L"Menu") != nullptr || wcsstr(cls, L"Tray") != nullptr ||
-         wcsstr(cls, L"Xaml") != nullptr);
+        (win32Menu || stemMatch || (style & WS_POPUP) != 0 || (ex & (WS_EX_TOPMOST | WS_EX_TOOLWINDOW)) != 0 || popupLikeClass);
 
     if (!newlyVisible && !movedOnScreen && !newlyFg) return -1;
 
+    // Prevent unrelated background apps from false-matching unless they look like an actual popup/menu.
+    if (!win32Menu && !stemMatch && !dock.trayMenuOwnerPid &&
+        (style & WS_POPUP) == 0 && (ex & (WS_EX_TOPMOST | WS_EX_TOOLWINDOW)) == 0 && !popupLikeClass)
+        return -1;
+
     int score = 10;
-    if (win32Menu) score += 140;
-    if (dock.trayMenuOwnerPid && dock.trayMenuOwnerPid == winPid) score += 90;
+    if (win32Menu) score += 150;
+    if (stemMatch) score += 135;
+    if (dock.trayMenuOwnerPid && dock.trayMenuOwnerPid == winPid) score += 100;
     if (isFg) score += 45;
     if ((style & WS_POPUP) != 0) score += 35;
     if ((ex & (WS_EX_TOPMOST | WS_EX_TOOLWINDOW)) != 0) score += 20;
-    if (wcsncmp(cls, L"WindowsForms10.", 15) == 0 || wcsncmp(cls, L"HwndWrapper[", 12) == 0 ||
-        wcsncmp(cls, L"Qt", 2) == 0 || wcsncmp(cls, L"Chrome_WidgetWin_", 17) == 0 ||
-        wcsncmp(cls, L"WinUIDesktop", 12) == 0 || wcsncmp(cls, L"Xaml_WindowedPopup", 18) == 0 ||
-        wcsstr(cls, L"Popup") != nullptr || wcsstr(cls, L"Menu") != nullptr ||
-        wcsstr(cls, L"Flyout") != nullptr || wcsstr(cls, L"Tray") != nullptr)
-        score += 25;
+    if (popupLikeClass) score += 25;
 
-    const auto distTo = [&](POINT pt) {
-        const int dx = pt.x < logicalRc.left ? logicalRc.left - pt.x : (pt.x > logicalRc.right ? pt.x - logicalRc.right : 0);
-        const int dy = pt.y < logicalRc.top ? logicalRc.top - pt.y : (pt.y > logicalRc.bottom ? pt.y - logicalRc.bottom : 0);
-        return std::max(dx, dy);
-    };
-    const int dist = std::min(distTo(dock.trayNativeClick), distTo(dock.trayActionPoint));
-    const int dpi = std::max<int>(96, static_cast<int>(GetDpiForWindow(dock.hwnd)));
-    if (dist <= MulDiv(80, dpi, 96)) score += 30;
-    else if (dist <= MulDiv(320, dpi, 96)) score += 15;
-    else score += 5;
+    if (cloaked && !hasOrigRect) {
+        // Caught at EVENT_OBJECT_CREATE before ever painting on-screen.
+        score += 28;
+    } else {
+        const auto distTo = [&](POINT pt) {
+            const int dx = pt.x < logicalRc.left ? logicalRc.left - pt.x : (pt.x > logicalRc.right ? pt.x - logicalRc.right : 0);
+            const int dy = pt.y < logicalRc.top ? logicalRc.top - pt.y : (pt.y > logicalRc.bottom ? pt.y - logicalRc.bottom : 0);
+            return std::max(dx, dy);
+        };
+        const int dist = std::min(distTo(dock.trayNativeClick), distTo(dock.trayActionPoint));
+        const int dpi = std::max<int>(96, static_cast<int>(GetDpiForWindow(dock.hwnd)));
+        if (dist <= MulDiv(80, dpi, 96)) score += 30;
+        else if (dist <= MulDiv(320, dpi, 96)) score += 15;
+        else score += 5;
+    }
     return score;
 }
 
@@ -438,14 +719,22 @@ bool looksLikeImmediatePopup(const Dock& dock, HWND w) {
         [w](const Dock::TrayWindowSnap& s) { return s.hwnd == w; });
     if (snap != dock.trayPreWindows.end() && snap->visible) return false;
 
+    const bool popupClass = wcsncmp(cls, L"WindowsForms10.", 15) == 0 || wcsncmp(cls, L"HwndWrapper[", 12) == 0 ||
+        wcsncmp(cls, L"Qt", 2) == 0 || wcsncmp(cls, L"Chrome_WidgetWin_", 17) == 0 ||
+        wcsncmp(cls, L"WinUIDesktop", 12) == 0 || wcsncmp(cls, L"Xaml_WindowedPopup", 18) == 0 ||
+        wcsncmp(cls, L"vguiPopupWindow", 15) == 0 || wcsncmp(cls, L"SDL_app", 7) == 0 ||
+        wcsstr(cls, L"Popup") != nullptr || wcsstr(cls, L"Menu") != nullptr ||
+        wcsstr(cls, L"Flyout") != nullptr || wcsstr(cls, L"Tray") != nullptr;
+
+    if (!dock.trayExpectedStem.empty() && winPid) {
+        const Text stem = cachedProcessStemLower(winPid);
+        if (!stemMatchesExpected(stem, dock.trayExpectedStem) && !popupClass) return false;
+    }
+
     const LONG_PTR style = GetWindowLongPtrW(w, GWL_STYLE);
     const LONG_PTR ex = GetWindowLongPtrW(w, GWL_EXSTYLE);
     if ((style & WS_POPUP) != 0 || (ex & (WS_EX_TOPMOST | WS_EX_TOOLWINDOW)) != 0) return true;
-    return wcsncmp(cls, L"WindowsForms10.", 15) == 0 || wcsncmp(cls, L"HwndWrapper[", 12) == 0 ||
-        wcsncmp(cls, L"Qt", 2) == 0 || wcsncmp(cls, L"Chrome_WidgetWin_", 17) == 0 ||
-        wcsncmp(cls, L"WinUIDesktop", 12) == 0 || wcsncmp(cls, L"Xaml_WindowedPopup", 18) == 0 ||
-        wcsstr(cls, L"Popup") != nullptr || wcsstr(cls, L"Menu") != nullptr ||
-        wcsstr(cls, L"Flyout") != nullptr || wcsstr(cls, L"Tray") != nullptr;
+    return popupClass;
 }
 
 HWND findTriggeredTrayPopup(const Dock& dock) {
@@ -477,7 +766,7 @@ void scanAndCloakNewPopups(Dock& dock) {
         }
         if (!isCloakedMenu(w) && looksLikeImmediatePopup(*d, w)) {
             RECT rc{};
-            if (GetWindowRect(w, &rc) && (rc.right - rc.left) >= 36 && (rc.bottom - rc.top) >= 16) {
+            if (GetWindowRect(w, &rc) && (rc.right - rc.left) >= 32 && (rc.bottom - rc.top) >= 14) {
                 cloakMenuWindow(w);
             }
         }
@@ -497,16 +786,214 @@ void scanAndCloakNewPopups(Dock& dock) {
     }
 }
 
-void CALLBACK trayWinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject, LONG, DWORD, DWORD) {
-    if (!gTrayDock || !hwnd) return;
+void fastScanAndCloakPopups(Dock& dock, bool fullEnum) {
+    // Ultra-fast kernel class lookup (~3 microseconds) catches Win32 #32768 menus & SysShadow before frame 0.
+    HWND shadow = nullptr;
+    while ((shadow = FindWindowExW(nullptr, shadow, L"SysShadow", nullptr)) != nullptr) {
+        if (IsWindowVisible(shadow)) hideSysShadowWindow(shadow);
+    }
+    HWND menuWnd = nullptr;
+    while ((menuWnd = FindWindowExW(nullptr, menuWnd, L"#32768", nullptr)) != nullptr) {
+        DWORD pid = 0;
+        GetWindowThreadProcessId(menuWnd, &pid);
+        if (pid == GetCurrentProcessId()) continue;
+        cloakMenuWindow(menuWnd);
+        if (IsWindowVisible(menuWnd)) {
+            const int sc = scoreTrayPopup(dock, menuWnd, true);
+            const int curSc = (dock.trayCapturedMenuHwnd && IsWindowVisible(dock.trayCapturedMenuHwnd))
+                ? scoreTrayPopup(dock, dock.trayCapturedMenuHwnd) : -1;
+            if (sc >= 0 && sc > curSc) {
+                dock.trayCapturedMenuHwnd = menuWnd;
+                dock.trayPopupSeenTries = 0;
+            }
+        }
+    }
+    if (fullEnum) scanAndCloakNewPopups(dock);
+}
+
+bool isGuardExcludedPopup(HWND w, wchar_t (&cls)[96], DWORD& outPid) {
+    if (!w || !IsWindow(w)) return true;
+    if (w == gGuardNotifyHwnd.load(std::memory_order_relaxed) ||
+        w == gGuardPanelHwnd.load(std::memory_order_relaxed) ||
+        isOverflowWindow(w)) return true;
+    if (!GetClassNameW(w, cls, ARRAYSIZE(cls))) return true;
+    GetWindowThreadProcessId(w, &outPid);
+    if (!outPid || outPid == GetCurrentProcessId()) return true;
+    if (wcscmp(cls, L"Shell_TrayWnd") == 0 || wcscmp(cls, L"Shell_SecondaryTrayWnd") == 0 ||
+        wcscmp(cls, L"Progman") == 0 || wcscmp(cls, L"WorkerW") == 0 ||
+        wcscmp(cls, L"tooltips_class32") == 0 || wcscmp(cls, L"SysShadow") == 0 ||
+        wcscmp(cls, L"IME") == 0 || wcscmp(cls, L"MSCTFIME UI") == 0 ||
+        wcscmp(cls, L"TaskListThumbnailWnd") == 0 || wcscmp(cls, L"MultitaskingViewFrame") == 0 ||
+        wcscmp(cls, L"Shell_InputSwitchTopLevelWindow") == 0 || wcscmp(cls, L"EdgeUiInputTopWndClass") == 0)
+        return true;
+    if (wcscmp(cls, L"#32768") == 0) return false;
+    if (const HWND tb = FindWindowW(L"Shell_TrayWnd", nullptr)) {
+        DWORD explorerPid = 0;
+        GetWindowThreadProcessId(tb, &explorerPid);
+        if (explorerPid && outPid == explorerPid) {
+            if (wcsstr(cls, L"Menu") == nullptr && wcsstr(cls, L"Popup") == nullptr &&
+                wcsstr(cls, L"Flyout") == nullptr && wcsstr(cls, L"Xaml_WindowedPopup") == nullptr)
+                return true;
+        }
+    }
+    return false;
+}
+
+void CALLBACK guardWinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject, LONG, DWORD, DWORD) {
+    if (!hwnd || !gGuardEnabled.load(std::memory_order_acquire)) return;
+
     if (idObject == OBJID_WINDOW && isOverflowWindow(hwnd)) {
-        if (gTrayDock->trayAction == Dock::TrayAction::Capture ||
-            gTrayDock->trayAction == Dock::TrayAction::LeftClick ||
-            ((gTrayDock->trayAction == Dock::TrayAction::RightClickMenu ||
-              gTrayDock->trayAction == Dock::TrayAction::ExecuteMenu) &&
-             !gTrayDock->trayFallbackMouseSent)) {
+        moveOverflowOffscreen(hwnd, true);
+        gGuardLastOverflow.store(hwnd, std::memory_order_release);
+        signalOverflowReadyEvent();
+        if (gGuardHideTaskbar.load(std::memory_order_relaxed)) {
+            if (const HWND tb = FindWindowW(L"Shell_TrayWnd", nullptr); tb && IsWindowVisible(tb))
+                ShowWindowAsync(tb, SW_HIDE);
+        }
+        return;
+    }
+
+    if (!gGuardCloakMenus.load(std::memory_order_acquire)) return;
+
+    if (gGuardLockCursor.load(std::memory_order_relaxed)) {
+        const LONG sx = gGuardCursorX.load(std::memory_order_relaxed);
+        const LONG sy = gGuardCursorY.load(std::memory_order_relaxed);
+        if (sx != 0 || sy != 0) {
+            POINT cur{};
+            if (GetCursorPos(&cur) && (cur.x != sx || cur.y != sy)) SetCursorPos(sx, sy);
+        }
+    }
+
+    if (event != EVENT_OBJECT_CREATE && event != EVENT_OBJECT_SHOW &&
+        event != EVENT_SYSTEM_MENUPOPUPSTART && event != EVENT_SYSTEM_FOREGROUND &&
+        event != EVENT_OBJECT_LOCATIONCHANGE)
+        return;
+
+    if (idObject != OBJID_WINDOW && event != EVENT_SYSTEM_MENUPOPUPSTART && event != EVENT_SYSTEM_FOREGROUND)
+        return;
+
+    wchar_t cls[96]{};
+    if (GetClassNameW(hwnd, cls, ARRAYSIZE(cls)) <= 0) return;
+    if (wcscmp(cls, L"SysShadow") == 0) {
+        hideSysShadowWindow(hwnd);
+        return;
+    }
+
+    const HWND root = GetAncestor(hwnd, GA_ROOT);
+    const HWND target = (wcscmp(cls, L"#32768") == 0) ? hwnd : (root ? root : hwnd);
+    DWORD winPid = 0;
+    if (isGuardExcludedPopup(target, cls, winPid)) return;
+
+    const bool win32Menu = (wcscmp(cls, L"#32768") == 0);
+    if (!win32Menu) {
+        bool wasPreVisible = false;
+        bool ignored = false;
+        DWORD expectedOwner = 0;
+        Text expectedStem;
+        {
+            std::lock_guard lock(gGuardFilterMutex);
+            wasPreVisible = gGuardPreVisible.contains(target);
+            ignored = gGuardIgnored.contains(target);
+            expectedOwner = gGuardOwnerPid;
+            expectedStem = gGuardExpectedStem;
+        }
+        if (ignored || wasPreVisible) return;
+        if (expectedOwner && expectedOwner != winPid) return;
+
+        const bool popupClass = wcsncmp(cls, L"WindowsForms10.", 15) == 0 || wcsncmp(cls, L"HwndWrapper[", 12) == 0 ||
+            wcsncmp(cls, L"Qt", 2) == 0 || wcsncmp(cls, L"Chrome_WidgetWin_", 17) == 0 ||
+            wcsncmp(cls, L"WinUIDesktop", 12) == 0 || wcsncmp(cls, L"Xaml_WindowedPopup", 18) == 0 ||
+            wcsncmp(cls, L"vguiPopupWindow", 15) == 0 || wcsncmp(cls, L"SDL_app", 7) == 0 ||
+            wcsstr(cls, L"Popup") != nullptr || wcsstr(cls, L"Menu") != nullptr ||
+            wcsstr(cls, L"Flyout") != nullptr || wcsstr(cls, L"Tray") != nullptr;
+        const LONG_PTR style = GetWindowLongPtrW(target, GWL_STYLE);
+        const LONG_PTR ex = GetWindowLongPtrW(target, GWL_EXSTYLE);
+        const bool popupStyle = (style & WS_POPUP) != 0 || (ex & (WS_EX_TOPMOST | WS_EX_TOOLWINDOW)) != 0;
+        if (!popupClass && !popupStyle) return;
+        if (!expectedStem.empty()) {
+            const Text stem = cachedProcessStemLower(winPid);
+            if (!stemMatchesExpected(stem, expectedStem) && !popupClass) return;
+        }
+    }
+
+    cloakMenuWindow(target, true);
+    if (event == EVENT_OBJECT_SHOW || event == EVENT_SYSTEM_MENUPOPUPSTART ||
+        event == EVENT_SYSTEM_FOREGROUND || IsWindowVisible(target)) {
+        const HWND prev = gGuardDetectedMenu.load(std::memory_order_acquire);
+        if (!prev || !IsWindowVisible(prev) || (win32Menu && !isWin32MenuClass(prev))) {
+            gGuardDetectedMenu.store(target, std::memory_order_release);
+        }
+        if (const HWND notify = gGuardNotifyHwnd.load(std::memory_order_relaxed)) {
+            if (!gInTraySync) PostMessageW(notify, WM_TIMER, TraySyncTick, 0);
+        }
+    }
+}
+
+void ensureTrayGuardStarted() {
+    std::lock_guard lock(gGuardLifecycleMutex);
+    if (gGuardThread.joinable()) return;
+    gGuardReadyEv = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    gGuardSyncEv = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    gGuardThread = std::thread([] {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+        MSG msg{};
+        PeekMessageW(&msg, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
+        gGuardTid = GetCurrentThreadId();
+        if (gGuardReadyEv) SetEvent(gGuardReadyEv);
+
+        std::array<HWINEVENTHOOK, 3> hooks{};
+        const auto unhookAll = [&]() {
+            for (auto& h : hooks) {
+                if (h) { UnhookWinEvent(h); h = nullptr; }
+            }
+        };
+
+        while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+            if (msg.message == kGuardMsgStart) {
+                unhookAll();
+                const DWORD pidFilter = static_cast<DWORD>(msg.wParam);
+                constexpr DWORD flags = WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS;
+                hooks[0] = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MENUPOPUPEND, nullptr,
+                    guardWinEventProc, pidFilter, 0, flags);
+                hooks[1] = SetWinEventHook(EVENT_OBJECT_CREATE, EVENT_OBJECT_HIDE, nullptr,
+                    guardWinEventProc, pidFilter, 0, flags);
+                hooks[2] = SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE, nullptr,
+                    guardWinEventProc, pidFilter, 0, flags);
+                if (gGuardSyncEv) SetEvent(gGuardSyncEv);
+            } else if (msg.message == kGuardMsgStop) {
+                unhookAll();
+                if (gGuardSyncEv) SetEvent(gGuardSyncEv);
+            } else {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+        unhookAll();
+    });
+    if (gGuardReadyEv) WaitForSingleObject(gGuardReadyEv, 500);
+}
+
+void shutdownTrayGuard() {
+    std::lock_guard lock(gGuardLifecycleMutex);
+    gGuardEnabled.store(false, std::memory_order_release);
+    gGuardCloakMenus.store(false, std::memory_order_release);
+    gGuardLockCursor.store(false, std::memory_order_release);
+    if (gGuardThread.joinable()) {
+        if (gGuardTid) PostThreadMessageW(gGuardTid, WM_QUIT, 0, 0);
+        gGuardThread.join();
+    }
+    gGuardTid = 0;
+    if (gGuardReadyEv) { CloseHandle(gGuardReadyEv); gGuardReadyEv = nullptr; }
+    if (gGuardSyncEv) { CloseHandle(gGuardSyncEv); gGuardSyncEv = nullptr; }
+}
+
+void CALLBACK trayWinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject, LONG, DWORD, DWORD) {
+    if (!hwnd) return;
+    if (idObject == OBJID_WINDOW && isOverflowWindow(hwnd)) {
+        moveOverflowOffscreen(hwnd);
+        signalOverflowReadyEvent();
+        if (gTrayDock && gTrayDock->trayAction != Dock::TrayAction::None) {
             gTrayDock->trayOverflow = hwnd;
-            moveOverflowOffscreen(hwnd);
             if (gTrayDock->trayNeedsReveal) {
                 if (const HWND tb = FindWindowW(L"Shell_TrayWnd", nullptr); tb && IsWindowVisible(tb))
                     ShowWindowAsync(tb, SW_HIDE);
@@ -514,11 +1001,15 @@ void CALLBACK trayWinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObj
         }
         return;
     }
+    if (!gTrayDock) return;
     if ((gTrayDock->trayAction == Dock::TrayAction::RightClickMenu ||
          gTrayDock->trayAction == Dock::TrayAction::ExecuteMenu) &&
         gTrayDock->trayRightClickPending) {
-        // Cloak menus and suppress SysShadow drop-shadows BEFORE Windows paints frame 0
-        // (even while gInTraySync is active so zero events are dropped during send/poll).
+        if (gTrayDock->trayCursorLocked && (gTrayDock->traySavedCursor.x != 0 || gTrayDock->traySavedCursor.y != 0)) {
+            POINT cur{};
+            if (GetCursorPos(&cur) && (cur.x != gTrayDock->traySavedCursor.x || cur.y != gTrayDock->traySavedCursor.y))
+                SetCursorPos(gTrayDock->traySavedCursor.x, gTrayDock->traySavedCursor.y);
+        }
         if ((event == EVENT_OBJECT_CREATE || event == EVENT_OBJECT_SHOW || event == EVENT_SYSTEM_MENUPOPUPSTART) &&
             (idObject == OBJID_WINDOW || event == EVENT_SYSTEM_MENUPOPUPSTART)) {
             wchar_t cls[32]{};
@@ -552,10 +1043,52 @@ void CALLBACK trayWinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObj
                 gTrayDock->trayCapturedMenuHwnd = candidate;
                 gTrayDock->trayPopupSeenTries = 0;
                 cloakMenuWindow(candidate);
-                if (!gInTraySync) PostMessageW(gTrayDock->hwnd, WM_TIMER, 10, 0);
+                if (!gInTraySync) PostMessageW(gTrayDock->hwnd, WM_TIMER, TraySyncTick, 0);
             }
         }
     }
+}
+
+void installTrayHooks(Dock& dock, DWORD processFilter = 0) {
+    for (auto& h : dock.trayHooks) {
+        if (h) { UnhookWinEvent(h); h = nullptr; }
+    }
+    gTrayDock = &dock;
+    gGuardNotifyHwnd.store(dock.hwnd, std::memory_order_relaxed);
+    gGuardPanelHwnd.store(dock.panel, std::memory_order_relaxed);
+    gGuardHideTaskbar.store(dock.trayNeedsReveal, std::memory_order_relaxed);
+    gGuardCloakMenus.store(dock.trayRightClickPending, std::memory_order_release);
+    gGuardEnabled.store(true, std::memory_order_release);
+
+    ensureTrayGuardStarted();
+    if (gGuardTid) {
+        if (gGuardSyncEv) ResetEvent(gGuardSyncEv);
+        PostThreadMessageW(gGuardTid, kGuardMsgStart, static_cast<WPARAM>(processFilter), 0);
+        if (gGuardSyncEv) WaitForSingleObject(gGuardSyncEv, 60);
+    }
+
+    constexpr DWORD flags = WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS;
+    dock.trayHooks[0] = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MENUPOPUPEND, nullptr,
+        trayWinEventProc, processFilter, 0, flags);
+    dock.trayHooks[1] = SetWinEventHook(EVENT_OBJECT_CREATE, EVENT_OBJECT_HIDE, nullptr,
+        trayWinEventProc, processFilter, 0, flags);
+    dock.trayHooks[2] = SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE, nullptr,
+        trayWinEventProc, processFilter, 0, flags);
+}
+
+void removeTrayHooks(Dock& dock) {
+    gGuardCloakMenus.store(false, std::memory_order_release);
+    gGuardLockCursor.store(false, std::memory_order_release);
+    gGuardEnabled.store(false, std::memory_order_release);
+    if (gGuardTid) {
+        if (gGuardSyncEv) ResetEvent(gGuardSyncEv);
+        PostThreadMessageW(gGuardTid, kGuardMsgStop, 0, 0);
+        if (gGuardSyncEv) WaitForSingleObject(gGuardSyncEv, 40);
+    }
+    for (auto& h : dock.trayHooks) {
+        if (h) { UnhookWinEvent(h); h = nullptr; }
+    }
+    if (gTrayDock == &dock) gTrayDock = nullptr;
 }
 
 bool tryInvoke(IUIAutomationElement* element) {
@@ -579,8 +1112,10 @@ bool tryInvoke(IUIAutomationElement* element) {
     return false;
 }
 
-bool tryInvokeAsync(IUIAutomationElement* element) {
-    if (!element) return false;
+enum class InvokeOutcome { Failed, Succeeded, TimedOut };
+
+InvokeOutcome tryInvokeBounded(IUIAutomationElement* element, DWORD timeoutMs = 220) {
+    if (!element) return InvokeOutcome::Failed;
 
     UIA_HWND native = nullptr;
     if (SUCCEEDED(element->get_CurrentNativeWindowHandle(&native)) && native) {
@@ -589,7 +1124,7 @@ bool tryInvokeAsync(IUIAutomationElement* element) {
             wchar_t cls[32]{};
             if (GetClassNameW(child, cls, ARRAYSIZE(cls)) > 0 && _wcsicmp(cls, L"Button") == 0) {
                 PostMessageW(child, BM_CLICK, 0, 0);
-                return true;
+                return InvokeOutcome::Succeeded;
             }
         }
     }
@@ -602,26 +1137,67 @@ bool tryInvokeAsync(IUIAutomationElement* element) {
             break;
         }
     }
-    if (!supported) return false;
+    if (!supported) return InvokeOutcome::Failed;
 
     IStream* stream = nullptr;
     if (FAILED(CoMarshalInterThreadInterfaceInStream(__uuidof(IUIAutomationElement), element, &stream)) || !stream)
-        return tryInvoke(element);
+        return tryInvoke(element) ? InvokeOutcome::Succeeded : InvokeOutcome::Failed;
 
-    std::thread([stream] {
+    struct Shared {
+        HANDLE doneEv = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        std::atomic<bool> ok{false};
+        ~Shared() { if (doneEv) CloseHandle(doneEv); }
+    };
+    auto shared = std::make_shared<Shared>();
+
+    std::thread([stream, shared] {
         const HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         ComPtr<IUIAutomationElement> target;
         if (SUCCEEDED(CoGetInterfaceAndReleaseStream(stream, IID_PPV_ARGS(&target))) && target) {
-            tryInvoke(target.Get());
+            shared->ok.store(tryInvoke(target.Get()), std::memory_order_release);
         }
+        if (shared->doneEv) SetEvent(shared->doneEv);
         if (SUCCEEDED(hr)) CoUninitialize();
     }).detach();
-    return true;
+
+    if (shared->doneEv && WaitForSingleObject(shared->doneEv, timeoutMs) == WAIT_OBJECT_0) {
+        return shared->ok.load(std::memory_order_acquire) ? InvokeOutcome::Succeeded : InvokeOutcome::Failed;
+    }
+    // Still running past timeoutMs (e.g. app opened a modal dialog from Invoke): treat as invoked.
+    return InvokeOutcome::TimedOut;
+}
+
+bool tryInvokeAsync(IUIAutomationElement* element) {
+    return tryInvokeBounded(element, 180) != InvokeOutcome::Failed;
 }
 
 bool findAndInvokeInRoot(IUIAutomation* automation, IUIAutomationCacheRequest* cacheReq,
-                         IUIAutomationElement* root, bool requireVisibleBounds) {
+                         IUIAutomationElement* root, bool requireVisibleBounds,
+                         ComPtr<IUIAutomationElement>* outChevron = nullptr) {
     if (!root || !automation || !cacheReq) return false;
+
+    // Fast path: targeted FindFirst for Windows 11's SystemTray.ChevronButton avoids serializing 100+ taskbar buttons.
+    VARIANT chevronCls{};
+    chevronCls.vt = VT_BSTR;
+    chevronCls.bstrVal = SysAllocString(L"SystemTray.ChevronButton");
+    if (chevronCls.bstrVal) {
+        ComPtr<IUIAutomationCondition> clsCond;
+        if (SUCCEEDED(automation->CreatePropertyCondition(UIA_ClassNamePropertyId, chevronCls, &clsCond)) && clsCond) {
+            ComPtr<IUIAutomationElement> direct;
+            if (SUCCEEDED(root->FindFirstBuildCache(TreeScope_Descendants, clsCond.Get(), cacheReq, &direct)) && direct) {
+                RECT rc{};
+                const bool visible = SUCCEEDED(direct->get_CachedBoundingRectangle(&rc)) &&
+                    rc.right > rc.left && rc.bottom > rc.top;
+                if ((visible || !requireVisibleBounds) && tryInvoke(direct.Get())) {
+                    if (outChevron) *outChevron = direct;
+                    VariantClear(&chevronCls);
+                    return true;
+                }
+            }
+        }
+        VariantClear(&chevronCls);
+    }
+
     VARIANT buttonType{};
     buttonType.vt = VT_I4;
     buttonType.lVal = UIA_ButtonControlTypeId;
@@ -663,6 +1239,7 @@ bool findAndInvokeInRoot(IUIAutomation* automation, IUIAutomationCacheRequest* c
         bool invoked = false;
         if (explicitMatch && (visible || !requireVisibleBounds)) {
             invoked = tryInvoke(el.Get());
+            if (invoked && outChevron) *outChevron = el;
         } else if (requireVisibleBounds && visible && normalTrayBtn && rc.left < leftmostX) {
             leftmostX = rc.left;
             leftmostNormal = el;
@@ -674,50 +1251,70 @@ bool findAndInvokeInRoot(IUIAutomation* automation, IUIAutomationCacheRequest* c
         if (invoked) return true;
     }
 
-    return requireVisibleBounds && leftmostNormal && tryInvoke(leftmostNormal.Get());
+    if (requireVisibleBounds && leftmostNormal && tryInvoke(leftmostNormal.Get())) {
+        if (outChevron) *outChevron = leftmostNormal;
+        return true;
+    }
+    return false;
 }
 
-bool invokeTrayOverflowWithUia(IUIAutomation* automation, HWND taskbar, bool requireVisibleBounds) {
+bool invokeTrayOverflowWithUia(IUIAutomation* automation, HWND taskbar, bool requireVisibleBounds,
+                               ComPtr<IUIAutomationElement>* outChevron = nullptr) {
     if (!automation || !taskbar) return false;
     auto cacheReq = createChevronButtonCacheReq(automation);
     if (!cacheReq) return false;
 
-    // Prioritize taskbar root and its XAML bridge / tray notify child windows to avoid redundant walks.
-    std::vector<HWND> preferred;
-    std::vector<HWND> fallback;
-    preferred.push_back(taskbar);
-    struct Gather { std::vector<HWND>* pref; std::vector<HWND>* fall; } g{&preferred, &fallback};
+    // Query only the XAML composition bridge / tray notify child windows directly (avoids 10+ redundant child walks).
+    std::vector<HWND> targets;
     EnumChildWindows(taskbar, [](HWND child, LPARAM lp) -> BOOL {
-        auto* ctx = reinterpret_cast<Gather*>(lp);
+        auto* list = reinterpret_cast<std::vector<HWND>*>(lp);
         wchar_t cls[96]{};
         if (GetClassNameW(child, cls, ARRAYSIZE(cls)) > 0 &&
             (wcscmp(cls, L"Windows.UI.Composition.DesktopWindowContentBridge") == 0 ||
              wcscmp(cls, L"TrayNotifyWnd") == 0 ||
              wcscmp(cls, L"ReBarWindow32") == 0)) {
-            ctx->pref->push_back(child);
-        } else {
-            ctx->fall->push_back(child);
+            list->push_back(child);
         }
         return TRUE;
-    }, reinterpret_cast<LPARAM>(&g));
+    }, reinterpret_cast<LPARAM>(&targets));
+    if (targets.empty()) targets.push_back(taskbar);
 
-    for (HWND target : preferred) {
+    for (HWND target : targets) {
         ComPtr<IUIAutomationElement> root;
         if (SUCCEEDED(automation->ElementFromHandle(target, &root)) && root &&
-            findAndInvokeInRoot(automation, cacheReq.Get(), root.Get(), requireVisibleBounds))
+            findAndInvokeInRoot(automation, cacheReq.Get(), root.Get(), requireVisibleBounds, outChevron))
             return true;
     }
-    for (HWND target : fallback) {
+    if (targets.front() != taskbar) {
         ComPtr<IUIAutomationElement> root;
-        if (SUCCEEDED(automation->ElementFromHandle(target, &root)) && root &&
-            findAndInvokeInRoot(automation, cacheReq.Get(), root.Get(), requireVisibleBounds))
+        if (SUCCEEDED(automation->ElementFromHandle(taskbar, &root)) && root &&
+            findAndInvokeInRoot(automation, cacheReq.Get(), root.Get(), requireVisibleBounds, outChevron))
             return true;
     }
     return false;
 }
 
 bool invokeTrayOverflow(HWND taskbar, bool requireVisibleBounds) {
-    return invokeTrayOverflowWithUia(sharedUia(), taskbar, requireVisibleBounds);
+    static HWND cachedTaskbar = nullptr;
+    static ComPtr<IUIAutomationElement> cachedChevron;
+    if (cachedTaskbar == taskbar && cachedChevron) {
+        RECT rc{};
+        const bool hasRect = SUCCEEDED(cachedChevron->get_CurrentBoundingRectangle(&rc)) &&
+            rc.right > rc.left && rc.bottom > rc.top;
+        if ((hasRect || !requireVisibleBounds) && tryInvoke(cachedChevron.Get())) {
+            return true;
+        }
+        cachedChevron.Reset();
+    }
+    ComPtr<IUIAutomationElement> found;
+    if (invokeTrayOverflowWithUia(sharedUia(), taskbar, requireVisibleBounds, &found)) {
+        if (found) {
+            cachedTaskbar = taskbar;
+            cachedChevron = std::move(found);
+        }
+        return true;
+    }
+    return false;
 }
 
 bool invokeViaWinBWithUia(IUIAutomation* automation, HWND taskbar) {
@@ -846,15 +1443,42 @@ Text fileStemLower(const Text& path) {
 }
 
 struct NotifyIconEntry {
+    Text subKey;
     Text tip;
     Text tipLower;
     Text exePath;
     Text exeStemLower;
     bool exeExists = false;
-    std::vector<BYTE> png;
-    int pngW = 0;
-    int pngH = 0;
+    DWORD pngBytes = 0;
 };
+
+struct NotifyPngBlob {
+    std::vector<BYTE> png;
+    int w = 0;
+    int h = 0;
+};
+
+NotifyPngBlob readNotifyIconPng(const Text& subKey) {
+    NotifyPngBlob out{};
+    if (subKey.empty()) return out;
+    const Text fullKey = L"Control Panel\\NotifyIconSettings\\" + subKey;
+    DWORD bytes = 0;
+    if (RegGetValueW(HKEY_CURRENT_USER, fullKey.c_str(), L"IconSnapshot", RRF_RT_REG_BINARY,
+            nullptr, nullptr, &bytes) != ERROR_SUCCESS || bytes <= 24)
+        return out;
+    out.png.resize(bytes);
+    if (RegGetValueW(HKEY_CURRENT_USER, fullKey.c_str(), L"IconSnapshot", RRF_RT_REG_BINARY,
+            nullptr, out.png.data(), &bytes) != ERROR_SUCCESS) {
+        out.png.clear();
+        return out;
+    }
+    static const BYTE kPngSig[8] = {0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A};
+    if (out.png.size() >= 24 && memcmp(out.png.data(), kPngSig, 8) == 0) {
+        out.w = (out.png[16] << 24) | (out.png[17] << 16) | (out.png[18] << 8) | out.png[19];
+        out.h = (out.png[20] << 24) | (out.png[21] << 16) | (out.png[22] << 8) | out.png[23];
+    }
+    return out;
+}
 
 std::vector<NotifyIconEntry> loadNotifyIconRegistry() {
     std::vector<NotifyIconEntry> entries;
@@ -862,6 +1486,7 @@ std::vector<NotifyIconEntry> loadNotifyIconRegistry() {
     if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Control Panel\\NotifyIconSettings", 0, KEY_READ, &root) != ERROR_SUCCESS)
         return entries;
 
+    std::unordered_map<Text, bool> existsCache;
     wchar_t subName[128]{};
     for (DWORD idx = 0;; ++idx) {
         DWORD nameLen = ARRAYSIZE(subName);
@@ -871,6 +1496,7 @@ std::vector<NotifyIconEntry> loadNotifyIconRegistry() {
         if (RegOpenKeyExW(root, subName, 0, KEY_READ, &sub) != ERROR_SUCCESS) continue;
 
         NotifyIconEntry e{};
+        e.subKey = subName;
         wchar_t regTip[512]{};
         DWORD tipBytes = sizeof(regTip);
         if (RegGetValueW(sub, nullptr, L"InitialTooltip", RRF_RT_REG_SZ, nullptr, regTip, &tipBytes) == ERROR_SUCCESS && regTip[0]) {
@@ -882,24 +1508,21 @@ std::vector<NotifyIconEntry> loadNotifyIconRegistry() {
         if (RegGetValueW(sub, nullptr, L"ExecutablePath", RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ, nullptr, regExe, &exeBytes) == ERROR_SUCCESS && regExe[0]) {
             e.exePath = expandKnownFolderPrefix(regExe);
             e.exeStemLower = fileStemLower(e.exePath);
-            const DWORD attr = GetFileAttributesW(e.exePath.c_str());
-            e.exeExists = (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY));
-        }
-        DWORD pngBytes = 0;
-        if (RegGetValueW(sub, nullptr, L"IconSnapshot", RRF_RT_REG_BINARY, nullptr, nullptr, &pngBytes) == ERROR_SUCCESS && pngBytes > 24) {
-            e.png.resize(pngBytes);
-            if (RegGetValueW(sub, nullptr, L"IconSnapshot", RRF_RT_REG_BINARY, nullptr, e.png.data(), &pngBytes) == ERROR_SUCCESS) {
-                static const BYTE kPngSig[8] = {0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A};
-                if (e.png.size() >= 24 && memcmp(e.png.data(), kPngSig, 8) == 0) {
-                    e.pngW = (e.png[16] << 24) | (e.png[17] << 16) | (e.png[18] << 8) | e.png[19];
-                    e.pngH = (e.png[20] << 24) | (e.png[21] << 16) | (e.png[22] << 8) | e.png[23];
-                }
+            const auto cachedIt = existsCache.find(e.exePath);
+            if (cachedIt != existsCache.end()) {
+                e.exeExists = cachedIt->second;
             } else {
-                e.png.clear();
+                const DWORD attr = GetFileAttributesW(e.exePath.c_str());
+                e.exeExists = (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY));
+                existsCache.emplace(e.exePath, e.exeExists);
             }
         }
+        DWORD pngBytes = 0;
+        if (RegQueryValueExW(sub, L"IconSnapshot", nullptr, nullptr, nullptr, &pngBytes) == ERROR_SUCCESS && pngBytes > 24) {
+            e.pngBytes = pngBytes;
+        }
         RegCloseKey(sub);
-        if (!e.tip.empty() || !e.exePath.empty() || !e.png.empty())
+        if (!e.tip.empty() || !e.exePath.empty() || e.pngBytes > 0)
             entries.push_back(std::move(e));
     }
     RegCloseKey(root);
@@ -1123,7 +1746,7 @@ const NotifyIconEntry* matchNotifyRegistry(const std::vector<NotifyIconEntry>& e
 
         int rank = score * 1000;
         if (e.exeExists) rank += 400;
-        rank += std::min(e.pngW, 512);
+        rank += std::min<int>(static_cast<int>(e.pngBytes / 32), 512);
         if (rank > bestRank) {
             bestRank = rank;
             best = &e;
@@ -1144,19 +1767,29 @@ std::shared_ptr<Gdiplus::Bitmap> resolveCrispTrayIcon(const Text& name, HICON ve
     const Text exeStem = reg ? reg->exeStemLower : Text{};
     const bool statusIcon = isDynamicStatusTrayIcon(nameLow, exeStem);
 
+    std::optional<NotifyPngBlob> lazyPng;
+    const auto getPng = [&]() -> const NotifyPngBlob& {
+        if (!lazyPng) {
+            lazyPng = (reg && reg->pngBytes > 24) ? readNotifyIconPng(reg->subKey) : NotifyPngBlob{};
+        }
+        return *lazyPng;
+    };
+
     // 1. Dynamic Windows status icons (SecurityHealth, Intel RST, Safely Remove):
     // prefer LIVE PrintWindow capture first so the current green check / warning badge stays accurate.
     if (statusIcon) {
         if (printCaptured) return printCaptured;
-        if (reg && !reg->png.empty()) {
-            if (auto bmp = decodePngNormalized(reg->png)) return bmp;
+        if (const auto& snap = getPng(); !snap.png.empty()) {
+            if (auto bmp = decodePngNormalized(snap.png)) return bmp;
         }
     }
 
     // 2. High-res true-alpha IconSnapshot (>=48px: e.g. Antigravity 512px, NVIDIA 128px, Veloce 64px).
-    // Strip opaque dark outer square (e.g. NVIDIA's baked dark grey box) so the logo floats cleanly.
-    if (reg && !reg->png.empty() && reg->pngW >= 48) {
-        if (auto bmp = decodePngNormalized(reg->png, true)) return bmp;
+    if (reg && reg->pngBytes > 24) {
+        const auto& snap = getPng();
+        if (!snap.png.empty() && snap.w >= 48) {
+            if (auto bmp = decodePngNormalized(snap.png, true)) return bmp;
+        }
     }
 
     // 3. High-res 128x128 native executable or MSIX/Store app icon (never accept generic .exe placeholders).
@@ -1175,20 +1808,26 @@ std::shared_ptr<Gdiplus::Bitmap> resolveCrispTrayIcon(const Text& name, HICON ve
     }
 
     // 4. Medium-res true-alpha IconSnapshot (>=24px: e.g. Monster 24px, PowerToys 32px, FocusSwitch 32px, Steam 32px).
-    if (reg && !reg->png.empty() && reg->pngW >= 24) {
-        if (auto bmp = decodePngNormalized(reg->png, true)) return bmp;
+    if (reg && reg->pngBytes > 24) {
+        const auto& snap = getPng();
+        if (!snap.png.empty() && snap.w >= 24) {
+            if (auto bmp = decodePngNormalized(snap.png, true)) return bmp;
+        }
     }
 
     // 5. Cleaned PrintWindow capture, then any remaining IconSnapshot.
     if (printCaptured) return printCaptured;
-    if (reg && !reg->png.empty()) {
-        if (auto bmp = decodePngNormalized(reg->png, true)) return bmp;
+    if (reg && reg->pngBytes > 24) {
+        const auto& snap = getPng();
+        if (!snap.png.empty()) {
+            if (auto bmp = decodePngNormalized(snap.png, true)) return bmp;
+        }
     }
     return nullptr;
 }
 
 std::shared_ptr<Gdiplus::Bitmap> lookupNotifyIconSnapshot(const Text& tip) {
-    const auto entries = loadNotifyIconRegistry();
+    const auto entries = cachedNotifyIconRegistry(false);
     return resolveCrispTrayIcon(tip, nullptr, entries, nullptr);
 }
 }
@@ -1201,19 +1840,18 @@ std::shared_ptr<Gdiplus::Bitmap> resolveTrayIconBitmap(const Text& name, HICON v
 namespace {
 
 std::shared_ptr<Gdiplus::Bitmap> lookupCachedTrayIcon(const Text& name) {
+    if (name.empty()) return nullptr;
     const Text key = toLowerText(name.c_str());
-    if (isDynamicStatusTrayIcon(key, {})) return nullptr;
     std::lock_guard lock(gTrayCacheMutex);
     const auto it = gTrayIconBitmapCache.find(key);
     return it != gTrayIconBitmapCache.end() ? it->second : nullptr;
 }
 
 void storeCachedTrayIcon(const Text& name, const std::shared_ptr<Gdiplus::Bitmap>& bmp) {
-    if (!bmp) return;
+    if (!bmp || name.empty()) return;
     const Text key = toLowerText(name.c_str());
-    if (isDynamicStatusTrayIcon(key, {})) return;
     std::lock_guard lock(gTrayCacheMutex);
-    if (gTrayIconBitmapCache.size() > 96) gTrayIconBitmapCache.clear();
+    if (gTrayIconBitmapCache.size() > 160) gTrayIconBitmapCache.clear();
     gTrayIconBitmapCache[key] = bmp;
 }
 
@@ -1286,7 +1924,7 @@ bool isBuiltInTaskbarSystemButton(const Text& name, const Text& autoId, const Te
     return false;
 }
 
-std::vector<OverflowButton> collectOverflowButtonsWithUia(IUIAutomation* automation, HWND overflow) {
+std::vector<OverflowButton> collectOverflowButtonsWithUia(IUIAutomation* automation, HWND overflow, bool allowHiddenBounds = false) {
     std::vector<OverflowButton> items;
     if (!overflow || !automation) return items;
 
@@ -1303,61 +1941,83 @@ std::vector<OverflowButton> collectOverflowButtonsWithUia(IUIAutomation* automat
     const int dpi = std::max<int>(96, static_cast<int>(GetDpiForWindow(overflow)));
     const int maxDim = std::max(160, MulDiv(160, dpi, 96));
 
-    std::vector<HWND> roots;
-    roots.push_back(overflow);
-    EnumChildWindows(overflow, [](HWND child, LPARAM lp) -> BOOL {
-        reinterpret_cast<std::vector<HWND>*>(lp)->push_back(child);
-        return TRUE;
-    }, reinterpret_cast<LPARAM>(&roots));
+    // Query the XAML DesktopWindowContentBridge directly first; fall back to overflow/children only if empty.
+    std::vector<HWND> primary;
+    if (const HWND bridge = FindWindowExW(overflow, nullptr, L"Windows.UI.Composition.DesktopWindowContentBridge", nullptr))
+        primary.push_back(bridge);
+    else
+        primary.push_back(overflow);
 
     int unnamedCounter = 0;
-    for (HWND target : roots) {
-        ComPtr<IUIAutomationElement> root;
-        if (FAILED(automation->ElementFromHandle(target, &root)) || !root) continue;
-        ComPtr<IUIAutomationElementArray> buttons;
-        if (FAILED(root->FindAllBuildCache(TreeScope_Descendants, cond.Get(), cacheReq.Get(), &buttons)) || !buttons) continue;
+    const auto scanTargets = [&](const std::vector<HWND>& targets) {
+        for (HWND target : targets) {
+            ComPtr<IUIAutomationElement> root;
+            if (FAILED(automation->ElementFromHandle(target, &root)) || !root) continue;
+            ComPtr<IUIAutomationElementArray> buttons;
+            if (FAILED(root->FindAllBuildCache(TreeScope_Descendants, cond.Get(), cacheReq.Get(), &buttons)) || !buttons) continue;
 
-        int count = 0;
-        buttons->get_Length(&count);
-        for (int i = 0; i < count; ++i) {
-            ComPtr<IUIAutomationElement> el;
-            if (FAILED(buttons->GetElement(i, &el)) || !el) continue;
-            RECT rc{};
-            if (FAILED(el->get_CachedBoundingRectangle(&rc)) || rc.right <= rc.left || rc.bottom <= rc.top) continue;
-            const int rw = rc.right - rc.left, rh = rc.bottom - rc.top;
-            if (rw < 12 || rh < 12 || rw > maxDim || rh > maxDim) continue;
+            int count = 0;
+            buttons->get_Length(&count);
+            for (int i = 0; i < count; ++i) {
+                ComPtr<IUIAutomationElement> el;
+                if (FAILED(buttons->GetElement(i, &el)) || !el) continue;
+                RECT rc{};
+                const bool hasRect = SUCCEEDED(el->get_CachedBoundingRectangle(&rc)) && rc.right > rc.left && rc.bottom > rc.top;
+                if (!hasRect && !allowHiddenBounds) continue;
+                const int rw = rc.right - rc.left, rh = rc.bottom - rc.top;
+                if (hasRect && (rw < 12 || rh < 12 || rw > maxDim || rh > maxDim)) continue;
 
-            BSTR nameBstr{};
-            el->get_CachedName(&nameBstr);
-            Text name = nameBstr ? nameBstr : L"";
-            if (nameBstr) SysFreeString(nameBstr);
-            if (name.empty()) name = readCachedStringProp(el.Get(), UIA_LegacyIAccessibleNamePropertyId);
-            if (name.empty()) name = readCachedStringProp(el.Get(), UIA_HelpTextPropertyId);
+                BSTR nameBstr{};
+                el->get_CachedName(&nameBstr);
+                Text name = nameBstr ? nameBstr : L"";
+                if (nameBstr) SysFreeString(nameBstr);
+                if (name.empty()) name = readCachedStringProp(el.Get(), UIA_LegacyIAccessibleNamePropertyId);
+                if (name.empty()) name = readCachedStringProp(el.Get(), UIA_HelpTextPropertyId);
 
-            const Text autoId = readCachedStringProp(el.Get(), UIA_AutomationIdPropertyId);
-            const Text cls = readCachedStringProp(el.Get(), UIA_ClassNamePropertyId);
-            if (name.empty()) {
-                const bool looksTrayBtn = containsCI(cls.c_str(), L"SystemTray") ||
-                    containsCI(cls.c_str(), L"NotifyIcon") ||
-                    containsCI(autoId.c_str(), L"SystemTrayIcon") ||
-                    containsCI(autoId.c_str(), L"NotifyIcon") ||
-                    std::abs(rw - rh) <= 24;
-                if (!looksTrayBtn) continue;
-                name = L"Bildirim simgesi " + std::to_wstring(++unnamedCounter);
+                const Text autoId = readCachedStringProp(el.Get(), UIA_AutomationIdPropertyId);
+                const Text cls = readCachedStringProp(el.Get(), UIA_ClassNamePropertyId);
+                if (name.empty()) {
+                    if (!hasRect) continue;
+                    const bool looksTrayBtn = containsCI(cls.c_str(), L"SystemTray") ||
+                        containsCI(cls.c_str(), L"NotifyIcon") ||
+                        containsCI(autoId.c_str(), L"SystemTrayIcon") ||
+                        containsCI(autoId.c_str(), L"NotifyIcon") ||
+                        std::abs(rw - rh) <= 24;
+                    if (!looksTrayBtn) continue;
+                    name = L"Bildirim simgesi " + std::to_wstring(++unnamedCounter);
+                } else if (!hasRect) {
+                    const bool looksTrayBtn = containsCI(cls.c_str(), L"SystemTray") ||
+                        containsCI(cls.c_str(), L"NotifyIcon") ||
+                        containsCI(autoId.c_str(), L"SystemTrayIcon") ||
+                        containsCI(autoId.c_str(), L"NotifyIcon");
+                    if (!looksTrayBtn) continue;
+                }
+
+                std::vector<int> rid = readCachedRuntimeId(el.Get());
+                const bool duplicate = std::any_of(items.begin(), items.end(), [&](const OverflowButton& existing) {
+                    if (!rid.empty() && !existing.runtimeId.empty()) return existing.runtimeId == rid;
+                    if (!hasRect) return existing.name == name;
+                    return existing.name == name &&
+                        std::abs(existing.rect.left - rc.left) <= 8 &&
+                        std::abs(existing.rect.top - rc.top) <= 8;
+                });
+                if (!duplicate) items.push_back({std::move(name), rc, std::move(rid), el, false});
             }
-
-            std::vector<int> rid = readCachedRuntimeId(el.Get());
-            const bool duplicate = std::any_of(items.begin(), items.end(), [&](const OverflowButton& existing) {
-                if (!rid.empty() && !existing.runtimeId.empty()) return existing.runtimeId == rid;
-                return existing.name == name &&
-                    std::abs(existing.rect.left - rc.left) <= 8 &&
-                    std::abs(existing.rect.top - rc.top) <= 8;
-            });
-            if (!duplicate) items.push_back({std::move(name), rc, std::move(rid), el, false});
         }
+    };
+
+    scanTargets(primary);
+    if (items.empty()) {
+        std::vector<HWND> fallback;
+        if (primary.front() != overflow) fallback.push_back(overflow);
+        EnumChildWindows(overflow, [](HWND child, LPARAM lp) -> BOOL {
+            reinterpret_cast<std::vector<HWND>*>(lp)->push_back(child);
+            return TRUE;
+        }, reinterpret_cast<LPARAM>(&fallback));
+        scanTargets(fallback);
     }
 
-    std::sort(items.begin(), items.end(), [](const OverflowButton& a, const OverflowButton& b) {
+    std::stable_sort(items.begin(), items.end(), [](const OverflowButton& a, const OverflowButton& b) {
         if (std::abs(a.rect.top - b.rect.top) > 12) return a.rect.top < b.rect.top;
         return a.rect.left < b.rect.left;
     });
@@ -1379,7 +2039,6 @@ std::vector<OverflowButton> collectPromotedTaskbarButtonsWithUia(IUIAutomation* 
         return items;
 
     std::vector<HWND> roots;
-    roots.push_back(taskbar);
     EnumChildWindows(taskbar, [](HWND child, LPARAM lp) -> BOOL {
         wchar_t cls[96]{};
         if (GetClassNameW(child, cls, ARRAYSIZE(cls)) > 0 &&
@@ -1389,6 +2048,7 @@ std::vector<OverflowButton> collectPromotedTaskbarButtonsWithUia(IUIAutomation* 
         }
         return TRUE;
     }, reinterpret_cast<LPARAM>(&roots));
+    if (roots.empty()) roots.push_back(taskbar);
 
     LONG chevronLeft = -1;
     LONG omniLeft = 0x7FFFFFFF;
@@ -1483,11 +2143,9 @@ ComPtr<IUIAutomationScrollPattern> findOverflowVerticalScroller(IUIAutomation* a
         return nullptr;
 
     std::vector<HWND> roots;
+    if (const HWND bridge = FindWindowExW(overflow, nullptr, L"Windows.UI.Composition.DesktopWindowContentBridge", nullptr))
+        roots.push_back(bridge);
     roots.push_back(overflow);
-    EnumChildWindows(overflow, [](HWND child, LPARAM lp) -> BOOL {
-        reinterpret_cast<std::vector<HWND>*>(lp)->push_back(child);
-        return TRUE;
-    }, reinterpret_cast<LPARAM>(&roots));
 
     for (HWND target : roots) {
         ComPtr<IUIAutomationElement> root;
@@ -2361,40 +3019,39 @@ std::vector<TrayMenuItem> buildKasperskyMenu(const Text& appName) {
     std::vector<TrayMenuItem> result;
     if (containsCI(appName.c_str(), L"vpn")) {
         TrayMenuItem openItem{};
-        openItem.label = L"Kaspersky VPN";
+        openItem.label = L"Kaspersky VPN’i aç";
         openItem.rawName = openItem.label;
         openItem.cmdId = 9002;
+        openItem.rawMenuIndex = -1;
         openItem.isDefault = true;
         result.push_back(std::move(openItem));
-
-        TrayMenuItem exitItem{};
-        exitItem.label = L"Çık";
-        exitItem.rawName = exitItem.label;
-        exitItem.cmdId = 9003;
-        exitItem.rawMenuIndex = 1;
-        result.push_back(std::move(exitItem));
         return result;
     }
 
-    const wchar_t* labels[] = {
-        L"Kaspersky Premium",
-        L"Korumayı duraklat",
-        L"Ayarlar",
-        L"Rahatsız Etme Modunu Aç",
-        L"Oyun Modunu aç",
-        L"Müşteri hizmetleri",
-        L"Hakkında",
-        L"Çık"
-    };
-    for (int i = 0; i < static_cast<int>(ARRAYSIZE(labels)); ++i) {
-        TrayMenuItem item{};
-        item.label = labels[i];
-        item.rawName = labels[i];
-        item.cmdId = (i == 0) ? 9002 : (9100 + i);
-        item.rawMenuIndex = i ? i : -1;
-        item.isDefault = (i == 0);
-        result.push_back(std::move(item));
+    if (containsCI(appName.c_str(), L"password")) {
+        TrayMenuItem openItem{};
+        openItem.label = L"Kaspersky Password Manager’ı aç";
+        openItem.rawName = openItem.label;
+        openItem.cmdId = 9002;
+        openItem.rawMenuIndex = -1;
+        openItem.isDefault = true;
+        result.push_back(std::move(openItem));
+        return result;
     }
+
+    TrayMenuItem openItem{};
+    openItem.label = L"Kaspersky’yi aç";
+    openItem.rawName = openItem.label;
+    openItem.cmdId = 9002;
+    openItem.rawMenuIndex = -1;
+    openItem.isDefault = true;
+    result.push_back(std::move(openItem));
+
+    TrayMenuItem secItem{};
+    secItem.label = L"Windows Güvenliği";
+    secItem.rawName = secItem.label;
+    secItem.launchTarget = L"windowsdefender:";
+    result.push_back(std::move(secItem));
     return result;
 }
 
@@ -2420,18 +3077,13 @@ std::vector<TrayMenuItem> buildNvidiaTrayMenu(const Text& name) {
         TrayMenuItem item{};
         item.label = label;
         item.launchTarget = std::move(target);
+        item.isDefault = items.empty();
         items.push_back(std::move(item));
     };
     addApp(L"NVIDIA App", L"shell:AppsFolder\\com.nvidia.nvapp",
         L"\\NVIDIA Corporation\\NVIDIA App\\CEF\\NVIDIA App.exe");
     addApp(L"NVIDIA Denetim Masası", L"shell:AppsFolder\\NVIDIACorp.NVIDIAControlPanel_56jybvy8sckqj!NVIDIACorp.NVIDIAControlPanel",
         L"\\NVIDIA Corporation\\Control Panel Client\\nvcplui.exe");
-    if (!items.empty()) {
-        TrayMenuItem exit{};
-        exit.label = L"Çık · Windows erişimi kısıtlı";
-        exit.disabled = true;
-        items.push_back(std::move(exit));
-    }
     return items;
 }
 
@@ -2472,14 +3124,15 @@ std::vector<TrayMenuItem> convertMsaaEntries(const std::vector<MsaaMenuEntry>& m
     return result;
 }
 
-void dismissPopupMenu(HWND menuHwnd) {
+void dismissPopupMenu(HWND menuHwnd, bool async = false) {
     if (!menuHwnd || !IsWindow(menuHwnd)) return;
     // Keep the menu cloaked & offscreen UNTIL the target app actually hides it,
     // so it NEVER flashes on-screen right before Vetra's UI opens.
     cloakMenuWindow(menuHwnd);
     if (isWin32MenuClass(menuHwnd)) {
         DWORD_PTR r = 0;
-        SendMessageTimeoutW(menuHwnd, 0x01E6 /*MN_CANCELMENUS*/, 0, 0, SMTO_ABORTIFHUNG, 60, &r);
+        if (async) PostMessageW(menuHwnd, 0x01E6 /*MN_CANCELMENUS*/, 0, 0);
+        else SendMessageTimeoutW(menuHwnd, 0x01E6 /*MN_CANCELMENUS*/, 0, 0, SMTO_ABORTIFHUNG, 50, &r);
         PostMessageW(menuHwnd, WM_KEYDOWN, VK_ESCAPE, 0);
         PostMessageW(menuHwnd, WM_KEYUP, VK_ESCAPE, 0);
     } else {
@@ -2488,11 +3141,34 @@ void dismissPopupMenu(HWND menuHwnd) {
         PostMessageW(menuHwnd, WM_KEYDOWN, VK_ESCAPE, 0);
         PostMessageW(menuHwnd, WM_KEYUP, VK_ESCAPE, 0);
     }
-    for (int wait = 0; wait < 9 && IsWindow(menuHwnd) && IsWindowVisible(menuHwnd); ++wait) {
-        Sleep(5);
+    if (!async) {
+        ScopedHighResTimer hiRes;
+        for (int wait = 0; wait < 8 && IsWindow(menuHwnd) && IsWindowVisible(menuHwnd); ++wait) {
+            Sleep(2);
+        }
     }
     // Restores immediately if hidden, or defers until !IsWindowVisible(menuHwnd).
-    uncloakMenuWindow(menuHwnd, false);
+    uncloakMenuWindow(menuHwnd, false, false);
+}
+
+bool tryExpandSubmenuNonCursor(HWND menuHwnd, IUIAutomationElement* element, ComPtr<IUIAutomationExpandCollapsePattern>& outExpand) {
+    if (!element) return false;
+    if (SUCCEEDED(element->GetCurrentPatternAs(UIA_ExpandCollapsePatternId, IID_PPV_ARGS(&outExpand))) && outExpand &&
+        SUCCEEDED(outExpand->Expand())) {
+        return true;
+    }
+    ComPtr<IUIAutomationSelectionItemPattern> select;
+    if (SUCCEEDED(element->GetCurrentPatternAs(UIA_SelectionItemPatternId, IID_PPV_ARGS(&select))) && select &&
+        SUCCEEDED(select->Select())) {
+        if (menuHwnd && IsWindow(menuHwnd)) PostMessageW(menuHwnd, WM_KEYDOWN, VK_RIGHT, 0);
+        return true;
+    }
+    element->SetFocus();
+    if (menuHwnd && IsWindow(menuHwnd)) {
+        PostMessageW(menuHwnd, WM_KEYDOWN, VK_RIGHT, 0);
+        return true;
+    }
+    return false;
 }
 
 std::vector<TrayMenuItem> convertUiaEntries(HWND menuHwnd, const std::vector<UiaMenuEntry>& uiaEntries,
@@ -2525,25 +3201,15 @@ std::vector<TrayMenuItem> convertUiaEntries(HWND menuHwnd, const std::vector<Uia
         item.checked = u.checked;
         item.hasSubmenu = u.hasSubmenu;
 
-        if (u.hasSubmenu && u.enabled && depth < 2 && expandedSubmenus < 6 && u.element && ownerPid) {
+        if (u.hasSubmenu && u.enabled && depth < 2 && expandedSubmenus < 5 && u.element && ownerPid) {
             ++expandedSubmenus;
             const auto before = snapshotVisibleForPid(ownerPid);
             ComPtr<IUIAutomationExpandCollapsePattern> expand;
-            bool opened = false;
-            bool usedHover = false;
-            POINT savedCursor{};
-            if (SUCCEEDED(u.element->GetCurrentPatternAs(UIA_ExpandCollapsePatternId, IID_PPV_ARGS(&expand))) && expand &&
-                SUCCEEDED(expand->Expand())) {
-                opened = true;
-            } else if (!IsRectEmpty(&u.rect)) {
-                GetCursorPos(&savedCursor);
-                SetCursorPos((u.rect.left + u.rect.right) / 2, (u.rect.top + u.rect.bottom) / 2);
-                opened = usedHover = true;
-            }
-            if (opened) {
+            if (tryExpandSubmenuNonCursor(menuHwnd, u.element.Get(), expand)) {
+                ScopedHighResTimer hiRes;
                 HWND subPopup = nullptr;
                 std::vector<UiaMenuEntry> subEntries;
-                for (int wait = 0; wait < 4; ++wait) {
+                for (int wait = 0; wait < 3; ++wait) {
                     subPopup = findNewPopupForPid(ownerPid, before);
                     if (subPopup) {
                         cloakMenuWindow(subPopup);
@@ -2552,7 +3218,7 @@ std::vector<TrayMenuItem> convertUiaEntries(HWND menuHwnd, const std::vector<Uia
                     }
                     subEntries = collectUiaMenuEntriesDeep(menuHwnd, true, u.element.Get());
                     if (!subEntries.empty()) break;
-                    Sleep(14);
+                    Sleep(4);
                 }
                 if (!subEntries.empty()) {
                     std::vector<Text> nextParents = parentLabels;
@@ -2560,8 +3226,7 @@ std::vector<TrayMenuItem> convertUiaEntries(HWND menuHwnd, const std::vector<Uia
                     item.children = convertUiaEntries(subPopup ? subPopup : menuHwnd, subEntries, nextParents, depth + 1);
                 }
                 if (expand) expand->Collapse();
-                if (usedHover) SetCursorPos(savedCursor.x, savedCursor.y);
-                if (subPopup && IsWindowVisible(subPopup)) dismissPopupMenu(subPopup);
+                if (subPopup && IsWindowVisible(subPopup)) dismissPopupMenu(subPopup, true);
             }
         }
         result.push_back(std::move(item));
@@ -2592,69 +3257,59 @@ std::vector<TrayMenuItem> extractPopupMenuItems(HWND menuHwnd) {
     return {};
 }
 
-bool clickMenuRow(HWND menuWindow, RECT row) {
-    if (IsRectEmpty(&row)) return false;
-    RECT winRect{};
-    if (!GetWindowRect(menuWindow, &winRect)) return false;
-    const auto cloakedIt = std::find_if(gCloakedMenus.begin(), gCloakedMenus.end(),
-        [menuWindow](const CloakedMenuRecord& r) { return r.hwnd == menuWindow; });
-    const bool hadCloak = (cloakedIt != gCloakedMenus.end());
-    const bool wasOffscreen = hadCloak && cloakedIt->movedOffscreen && !IsRectEmpty(&cloakedIt->origRect);
-    const bool hadEmptyRgn = hadCloak && cloakedIt->changedRgn;
-    const bool hadLayered = hadCloak && cloakedIt->changedEx;
+bool waitPopupClosed(HWND popup, int maxMs) {
+    ScopedHighResTimer hiRes;
+    for (int elapsed = 0; elapsed < maxMs; elapsed += 2) {
+        if (!IsWindow(popup) || !IsWindowVisible(popup)) return true;
+        Sleep(2);
+    }
+    return !IsWindow(popup) || !IsWindowVisible(popup);
+}
 
-    const int lx = (row.left + row.right) / 2 - winRect.left;
-    const int ly = (row.top + row.bottom) / 2 - winRect.top;
-    POINT center{(row.left + row.right) / 2, (row.top + row.bottom) / 2};
-
-    if (wasOffscreen) {
-        const RECT& orig = cloakedIt->origRect;
-        center = {orig.left + lx, orig.top + ly};
-        if (HRGN spot = CreateRectRgn(lx - 1, ly - 1, lx + 2, ly + 2)) {
-            if (!SetWindowRgn(menuWindow, spot, FALSE)) DeleteObject(spot);
+bool postClientMenuClick(HWND menuWindow, RECT row, bool activateOffscreen = false) {
+    if (!menuWindow || !IsWindow(menuWindow) || IsRectEmpty(&row)) return false;
+    // Remove empty GDI region so framework hit-testing sees the client area while still offscreen & alpha=0.
+    restoreMenuRegionForClick(menuWindow);
+    if (activateOffscreen) {
+        DWORD pid = 0;
+        GetWindowThreadProcessId(menuWindow, &pid);
+        if (pid) AllowSetForegroundWindow(pid);
+        forceForegroundWindow(menuWindow);
+    }
+    POINT pt{(row.left + row.right) / 2, (row.top + row.bottom) / 2};
+    RECT winRc{};
+    if (GetWindowRect(menuWindow, &winRc) && !PtInRect(&winRc, pt)) {
+        RECT origRc{};
+        if (cloakedOrigRect(menuWindow, origRc) && PtInRect(&origRc, pt)) {
+            pt.x = winRc.left + (pt.x - origRc.left);
+            pt.y = winRc.top + (pt.y - origRc.top);
         }
-        if (hadLayered) SetLayeredWindowAttributes(menuWindow, 0, 1, LWA_ALPHA);
-        SetWindowPos(menuWindow, HWND_TOPMOST, orig.left, orig.top, 0, 0,
-            SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOSENDCHANGING);
-    } else {
-        if (hadEmptyRgn) {
-            if (HRGN spot = CreateRectRgn(lx - 1, ly - 1, lx + 2, ly + 2)) {
-                if (!SetWindowRgn(menuWindow, spot, FALSE)) DeleteObject(spot);
+    }
+    HWND target = menuWindow;
+    POINT clientPt = pt;
+    if (!ScreenToClient(menuWindow, &clientPt)) return false;
+    if (HWND child = ChildWindowFromPointEx(menuWindow, clientPt, CWP_SKIPINVISIBLE | CWP_SKIPDISABLED)) {
+        if (child != menuWindow) {
+            POINT childPt = pt;
+            if (ScreenToClient(child, &childPt)) {
+                target = child;
+                clientPt = childPt;
             }
         }
-        if (hadLayered) SetLayeredWindowAttributes(menuWindow, 0, 1, LWA_ALPHA);
-        SetWindowPos(menuWindow, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     }
+    const LPARAM lp = MAKELPARAM(clientPt.x, clientPt.y);
+    ScopedHighResTimer hiRes;
+    PostMessageW(target, WM_MOUSEMOVE, 0, lp);
+    Sleep(6);
+    PostMessageW(target, WM_LBUTTONDOWN, MK_LBUTTON, lp);
+    Sleep(10);
+    PostMessageW(target, WM_LBUTTONUP, 0, lp);
+    return true;
+}
 
-    const HWND hit = WindowFromPoint(center);
-    bool sent = false;
-    if (!hit || GetAncestor(hit, GA_ROOT) == menuWindow || hit == menuWindow) {
-        POINT saved{};
-        GetCursorPos(&saved);
-        SetCursorPos(center.x, center.y);
-        INPUT click[2]{};
-        click[0].type = click[1].type = INPUT_MOUSE;
-        click[0].mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
-        click[1].mi.dwFlags = MOUSEEVENTF_LEFTUP;
-        sent = SendInput(ARRAYSIZE(click), click, sizeof(INPUT)) == ARRAYSIZE(click);
-        SetCursorPos(saved.x, saved.y);
-    }
-
-    if (IsWindow(menuWindow)) {
-        if (hadLayered) SetLayeredWindowAttributes(menuWindow, 0, 0, LWA_ALPHA);
-        if (hadEmptyRgn || wasOffscreen) {
-            if (HRGN empty = CreateRectRgn(0, 0, 0, 0)) {
-                if (!SetWindowRgn(menuWindow, empty, FALSE)) DeleteObject(empty);
-            }
-        }
-        if (wasOffscreen) {
-            const int offX = GetSystemMetrics(SM_XVIRTUALSCREEN) - 4000;
-            const int offY = GetSystemMetrics(SM_YVIRTUALSCREEN) - 4000;
-            SetWindowPos(menuWindow, HWND_BOTTOM, offX, offY, 0, 0,
-                SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOSENDCHANGING);
-        }
-    }
-    return sent;
+bool labelsMatchCI(const Text& a, const Text& b) {
+    if (a.empty() || b.empty()) return false;
+    return CompareStringOrdinal(a.c_str(), -1, b.c_str(), -1, TRUE) == CSTR_EQUAL;
 }
 
 int findMenuCommand(HMENU menu, HWND menuWindow, const TrayMenuItem& item) {
@@ -2669,6 +3324,15 @@ int findMenuCommand(HMENU menu, HWND menuWindow, const TrayMenuItem& item) {
         wchar_t raw[256]{};
         GetMenuStringW(menu, i, raw, ARRAYSIZE(raw), MF_BYPOSITION);
         if (cleanMenuLabel(raw) != item.label || item.label.empty() || !usable(i)) continue;
+        if (match >= 0) { match = -1; break; }
+        match = i;
+    }
+    if (match >= 0) return match;
+
+    for (int i = 0; i < count; ++i) {
+        wchar_t raw[256]{};
+        GetMenuStringW(menu, i, raw, ARRAYSIZE(raw), MF_BYPOSITION);
+        if (!labelsMatchCI(cleanMenuLabel(raw), item.label) || !usable(i)) continue;
         if (match >= 0) { match = -1; break; }
         match = i;
     }
@@ -2690,16 +3354,35 @@ int findMenuCommand(HMENU menu, HWND menuWindow, const TrayMenuItem& item) {
 
     if (menuWindow && !item.label.empty()) {
         for (const auto& entry : collectMsaaMenuEntries(menuWindow)) {
-            if (entry.separator || entry.disabled || cleanMenuLabel(entry.name) != item.label) continue;
+            if (entry.separator || entry.disabled || !labelsMatchCI(cleanMenuLabel(entry.name), item.label)) continue;
             const int idx = static_cast<int>(entry.child) - 1;
             if (idx >= 0 && idx < count && usable(idx)) return idx;
+        }
+        size_t uiaNonSep = 0;
+        for (const auto& entry : collectUiaMenuEntriesDeep(menuWindow, true)) {
+            if (entry.separator) continue;
+            if (entry.enabled && labelsMatchCI(cleanMenuLabel(entry.name), item.label)) {
+                size_t posNonSep = 0;
+                for (int i = 0; i < count; ++i) {
+                    const auto st = GetMenuState(menu, i, MF_BYPOSITION);
+                    if (st == static_cast<UINT>(-1) || (st & MF_SEPARATOR)) continue;
+                    if (posNonSep == uiaNonSep && usable(i)) return i;
+                    ++posNonSep;
+                }
+            }
+            ++uiaNonSep;
         }
     }
 
     if (item.rawMenuIndex >= 0 && item.rawMenuIndex < count && usable(item.rawMenuIndex)) {
-        wchar_t raw[16]{};
+        wchar_t raw[256]{};
         if (GetMenuStringW(menu, item.rawMenuIndex, raw, ARRAYSIZE(raw), MF_BYPOSITION) == 0)
             return item.rawMenuIndex;
+        const Text curClean = cleanMenuLabel(raw);
+        if (!curClean.empty() && !item.label.empty() &&
+            (toLowerText(curClean.c_str()).rfind(toLowerText(item.label.c_str()).substr(0, std::min<size_t>(4, item.label.size())), 0) == 0)) {
+            return item.rawMenuIndex;
+        }
     }
     return -1;
 }
@@ -2730,15 +3413,38 @@ bool invokePopupMenuItem(HWND popup, const TrayMenuItem& item, const std::vector
         }
         const int index = findMenuCommand(menu, menuWindow, item);
         if (index >= 0 && !GetSubMenu(menu, index)) {
+            GUITHREADINFO gti{sizeof(gti)};
+            const DWORD tid = GetWindowThreadProcessId(menuWindow, nullptr);
+            HWND menuOwner = (tid && GetGUIThreadInfo(tid, &gti) && IsWindow(gti.hwndMenuOwner)) ? gti.hwndMenuOwner : nullptr;
             DWORD_PTR unused{};
-            SendMessageTimeoutW(menuWindow, 0x01E5 /*MN_SELECTITEM*/, index, 0, SMTO_ABORTIFHUNG, 100, &unused);
-            PostMessageW(menuWindow, 0x01ED /*MN_BUTTONDOWN*/, index, 0);
+
+            // Strategy 1: Synchronized MN_SELECTITEM + MN_BUTTONDOWN + asynchronous MN_BUTTONUP
+            // (works reliably for both TrackPopupMenuEx(TPM_RETURNCMD) and TrackPopupMenu(WM_COMMAND)).
+            SendMessageTimeoutW(menuWindow, 0x01E5 /*MN_SELECTITEM*/, index, 0, SMTO_ABORTIFHUNG, 80, &unused);
+            SendMessageTimeoutW(menuWindow, 0x01ED /*MN_BUTTONDOWN*/, index, 0, SMTO_ABORTIFHUNG, 80, &unused);
             PostMessageW(menuWindow, 0x01EF /*MN_BUTTONUP*/, index, 0);
-            Sleep(18);
-            if (!IsWindowVisible(popup)) return true;
-            RECT row{};
-            if (GetMenuItemRect(nullptr, menu, index, &row) && clickMenuRow(menuWindow, row)) return true;
-            return true;
+            if (waitPopupClosed(popup, 44)) return true;
+
+            // Strategy 2: MN_SELECTITEM + VK_RETURN to menu owner (and menuWindow).
+            SendMessageTimeoutW(menuWindow, 0x01E5 /*MN_SELECTITEM*/, index, 0, SMTO_ABORTIFHUNG, 80, &unused);
+            HWND keyTarget = menuOwner ? menuOwner : menuWindow;
+            PostMessageW(keyTarget, WM_KEYDOWN, VK_RETURN, 0x001C0001);
+            PostMessageW(keyTarget, WM_KEYUP, VK_RETURN, 0xC01C0001);
+            if (waitPopupClosed(popup, 36)) return true;
+            if (keyTarget != menuWindow) {
+                PostMessageW(menuWindow, WM_KEYDOWN, VK_RETURN, 0x001C0001);
+                PostMessageW(menuWindow, WM_KEYUP, VK_RETURN, 0xC01C0001);
+                if (waitPopupClosed(popup, 30)) return true;
+            }
+
+            // Strategy 3: Direct WM_COMMAND to menuOwner if popup stayed open and cmdId is known.
+            if (menuOwner && IsWindow(menuOwner) && item.cmdId != 0) {
+                SendMessageTimeoutW(popup, 0x01E6 /*MN_CANCELMENUS*/, 0, 0, SMTO_ABORTIFHUNG, 60, &unused);
+                waitPopupClosed(popup, 24);
+                PostMessageW(menuOwner, WM_COMMAND, MAKEWPARAM(item.cmdId, 0), 0);
+                return true;
+            }
+            return false;
         }
         if (menuWindow != popup) return false;
     }
@@ -2749,31 +3455,25 @@ bool invokePopupMenuItem(HWND popup, const TrayMenuItem& item, const std::vector
     ComPtr<IUIAutomationElement> scopeRoot;
     DWORD ownerPid = 0;
     GetWindowThreadProcessId(popup, &ownerPid);
+    if (ownerPid) AllowSetForegroundWindow(ownerPid);
+
     for (const Text& parentLabel : item.parentLabels) {
         const auto curEntries = collectUiaMenuEntriesDeep(activePopup, false, scopeRoot.Get());
         const auto it = std::find_if(curEntries.begin(), curEntries.end(), [&](const UiaMenuEntry& e) {
-            return !e.separator && e.enabled && cleanMenuLabel(e.name) == parentLabel;
+            return !e.separator && e.enabled && labelsMatchCI(cleanMenuLabel(e.name), parentLabel);
         });
         if (it == curEntries.end() || !it->element) return false;
         const auto before = snapshotVisibleForPid(ownerPid);
         ComPtr<IUIAutomationExpandCollapsePattern> expand;
-        POINT savedCursor{};
-        bool movedCursor = false;
-        if (SUCCEEDED(it->element->GetCurrentPatternAs(UIA_ExpandCollapsePatternId, IID_PPV_ARGS(&expand))) && expand &&
-            SUCCEEDED(expand->Expand())) {
-        } else if (!IsRectEmpty(&it->rect)) {
-            GetCursorPos(&savedCursor);
-            SetCursorPos((it->rect.left + it->rect.right) / 2, (it->rect.top + it->rect.bottom) / 2);
-            movedCursor = true;
-        }
+        if (!tryExpandSubmenuNonCursor(activePopup, it->element.Get(), expand)) return false;
+        ScopedHighResTimer hiRes;
         HWND nextPopup = nullptr;
-        for (int wait = 0; wait < 5; ++wait) {
+        for (int wait = 0; wait < 7; ++wait) {
             nextPopup = findNewPopupForPid(ownerPid, before);
             if (nextPopup) { cloakMenuWindow(nextPopup); break; }
             if (!collectUiaMenuEntriesDeep(activePopup, true, it->element.Get()).empty()) break;
-            Sleep(14);
+            Sleep(6);
         }
-        if (movedCursor) SetCursorPos(savedCursor.x, savedCursor.y);
         if (nextPopup) {
             activePopup = nextPopup;
             scopeRoot.Reset();
@@ -2782,30 +3482,141 @@ bool invokePopupMenuItem(HWND popup, const TrayMenuItem& item, const std::vector
         }
     }
 
-    for (const auto& entry : collectUiaMenuEntriesDeep(activePopup, false, scopeRoot.Get())) {
-        if (entry.separator || !entry.enabled || cleanMenuLabel(entry.name) != item.label) continue;
-        if (tryInvokeAsync(entry.element.Get()) || clickMenuRow(activePopup, entry.rect)) return true;
+    // Remove empty GDI region on non-#32768 popups (Electron / WPF / WinForms / WinUI / Qt) before invoking,
+    // while keeping them offscreen & alpha=0 so framework hit-tests and UIA actions succeed cleanly.
+    restoreMenuRegionForClick(activePopup);
+
+    const auto uiaList = collectUiaMenuEntriesDeep(activePopup, false, scopeRoot.Get());
+    const UiaMenuEntry* matched = nullptr;
+    for (const auto& entry : uiaList) {
+        if (!entry.separator && entry.enabled && cleanMenuLabel(entry.name) == item.label) {
+            matched = &entry;
+            break;
+        }
+    }
+    if (!matched) {
+        for (const auto& entry : uiaList) {
+            if (!entry.separator && entry.enabled && labelsMatchCI(cleanMenuLabel(entry.name), item.label)) {
+                matched = &entry;
+                break;
+            }
+        }
+    }
+    if (!matched && item.rawMenuIndex >= 0 && item.rawMenuIndex < static_cast<int>(uiaList.size())) {
+        const auto& cand = uiaList[item.rawMenuIndex];
+        if (!cand.separator && cand.enabled) matched = &cand;
+    }
+
+    if (matched) {
+        // Strategy 1: Bounded synchronous UIA Invoke (waits for Invoke to finish & popup to close,
+        // preventing stopTraySync/dismissPopupMenu from cancelling Electron/WPF/WinUI/Qt commands!).
+        if (matched->element) {
+            const InvokeOutcome out = tryInvokeBounded(matched->element.Get(), 220);
+            if (out == InvokeOutcome::TimedOut) return true;
+            if (out == InvokeOutcome::Succeeded && waitPopupClosed(activePopup, 110)) return true;
+        }
+
+        // Strategy 2: MSAA accDoDefaultAction if popup is still open.
+        if (item.parentLabels.empty() && IsWindow(activePopup) && IsWindowVisible(activePopup)) {
+            if (const auto acc = accessiblePopup(activePopup)) {
+                for (const auto& entry : collectMsaaMenuEntries(activePopup)) {
+                    if (entry.separator || entry.disabled || entry.hasSubmenu) continue;
+                    if (!labelsMatchCI(cleanMenuLabel(entry.name), item.label)) continue;
+                    VARIANT child{};
+                    child.vt = VT_I4;
+                    child.lVal = entry.child;
+                    if (acc->accDoDefaultAction(child) == S_OK && waitPopupClosed(activePopup, 60))
+                        return true;
+                }
+            }
+        }
+
+        // Strategy 3: Direct client mouse click using fresh live element bounding rect.
+        if (IsWindow(activePopup) && IsWindowVisible(activePopup)) {
+            RECT liveRect = matched->rect;
+            if (matched->element) {
+                RECT fresh{};
+                if (SUCCEEDED(matched->element->get_CurrentBoundingRectangle(&fresh)) && !IsRectEmpty(&fresh))
+                    liveRect = fresh;
+            }
+            if (postClientMenuClick(activePopup, liveRect, true) && waitPopupClosed(activePopup, 70))
+                return true;
+        }
+
+        // Strategy 4: Focus / Select element + VK_RETURN (offscreen), then arrow-key walk if still open.
+        if (matched->element && IsWindow(activePopup) && IsWindowVisible(activePopup)) {
+            ComPtr<IUIAutomationSelectionItemPattern> sel;
+            if (SUCCEEDED(matched->element->GetCurrentPatternAs(UIA_SelectionItemPatternId, IID_PPV_ARGS(&sel))) && sel)
+                sel->Select();
+            matched->element->SetFocus();
+            SetForegroundWindow(activePopup);
+            Sleep(10);
+            PostMessageW(activePopup, WM_KEYDOWN, VK_RETURN, 0x001C0001);
+            PostMessageW(activePopup, WM_KEYUP, VK_RETURN, 0xC01C0001);
+            if (waitPopupClosed(activePopup, 50)) return true;
+            if (GetForegroundWindow() == activePopup) {
+                INPUT enter[2]{};
+                enter[0].type = enter[1].type = INPUT_KEYBOARD;
+                enter[0].ki.wVk = enter[1].ki.wVk = VK_RETURN;
+                enter[1].ki.dwFlags = KEYEVENTF_KEYUP;
+                SendInput(ARRAYSIZE(enter), enter, sizeof(INPUT));
+                if (waitPopupClosed(activePopup, 50)) return true;
+            }
+            // Arrow-key walk fallback for custom popups (e.g. Qt QMenu) that ignore UIA SetFocus on items.
+            if (IsWindow(activePopup) && IsWindowVisible(activePopup)) {
+                int navSteps = 0;
+                bool foundPos = false;
+                for (const auto& e : uiaList) {
+                    if (e.separator || !e.enabled) continue;
+                    ++navSteps;
+                    if (&e == matched) { foundPos = true; break; }
+                }
+                if (foundPos && navSteps > 0 && navSteps <= 24) {
+                    SetForegroundWindow(activePopup);
+                    for (int k = 0; k < navSteps; ++k) {
+                        PostMessageW(activePopup, WM_KEYDOWN, VK_DOWN, 0x01500001);
+                        PostMessageW(activePopup, WM_KEYUP, VK_DOWN, 0xC1500001);
+                        Sleep(2);
+                    }
+                    PostMessageW(activePopup, WM_KEYDOWN, VK_RETURN, 0x001C0001);
+                    PostMessageW(activePopup, WM_KEYUP, VK_RETURN, 0xC01C0001);
+                    if (waitPopupClosed(activePopup, 60)) return true;
+                }
+            }
+        }
+        return !IsWindow(activePopup) || !IsWindowVisible(activePopup);
     }
 
     if (item.parentLabels.empty()) {
         if (const auto acc = accessiblePopup(popup)) {
             const auto entries = collectMsaaMenuEntries(popup);
             for (const auto& entry : entries) {
-                if (entry.separator || entry.disabled || entry.hasSubmenu || cleanMenuLabel(entry.name) != item.label) continue;
+                if (entry.separator || entry.disabled || entry.hasSubmenu || !labelsMatchCI(cleanMenuLabel(entry.name), item.label)) continue;
                 VARIANT child{};
                 child.vt = VT_I4;
                 child.lVal = entry.child;
-                if (acc->accDoDefaultAction(child) == S_OK || clickMenuRow(popup, entry.rect)) return true;
+                if (acc->accDoDefaultAction(child) == S_OK && waitPopupClosed(popup, 60)) return true;
+                if (postClientMenuClick(popup, entry.rect, true) && waitPopupClosed(popup, 60)) return true;
             }
         }
     }
     return false;
 }
+
 void sendContextMenuKey() {
     INPUT keys[2]{};
     keys[0].type = keys[1].type = INPUT_KEYBOARD;
     keys[0].ki.wVk = keys[1].ki.wVk = VK_APPS;
     keys[1].ki.dwFlags = KEYEVENTF_KEYUP;
+    SendInput(ARRAYSIZE(keys), keys, sizeof(INPUT));
+}
+
+void sendShiftF10Key() {
+    INPUT keys[4]{};
+    for (auto& k : keys) k.type = INPUT_KEYBOARD;
+    keys[0].ki.wVk = keys[3].ki.wVk = VK_SHIFT;
+    keys[1].ki.wVk = keys[2].ki.wVk = VK_F10;
+    keys[2].ki.dwFlags = keys[3].ki.dwFlags = KEYEVENTF_KEYUP;
     SendInput(ARRAYSIZE(keys), keys, sizeof(INPUT));
 }
 
@@ -2828,13 +3639,108 @@ void cloakTaskbarForTempReveal(HWND taskbar) {
     }
 }
 
-void microBurstCloakPopups(Dock& dock, int maxMs = 36) {
-    const int steps = std::max(1, maxMs / 2);
-    for (int i = 0; i < steps; ++i) {
-        scanAndCloakNewPopups(dock);
-        if (dock.trayCapturedMenuHwnd && IsWindowVisible(dock.trayCapturedMenuHwnd)) return;
-        Sleep(2);
+void adoptGuardDetectedMenu(Dock& dock) {
+    const HWND detected = gGuardDetectedMenu.exchange(nullptr, std::memory_order_acq_rel);
+    if (!detected || !IsWindow(detected) || !IsWindowVisible(detected)) return;
+    const int sc = scoreTrayPopup(dock, detected, true);
+    if (sc < 0) return;
+    const int curSc = (dock.trayCapturedMenuHwnd && IsWindowVisible(dock.trayCapturedMenuHwnd))
+        ? scoreTrayPopup(dock, dock.trayCapturedMenuHwnd) : -1;
+    if (!dock.trayCapturedMenuHwnd || !IsWindowVisible(dock.trayCapturedMenuHwnd) || sc > curSc + 15) {
+        dock.trayCapturedMenuHwnd = detected;
+        dock.trayPopupSeenTries = 0;
+        cloakMenuWindow(detected);
     }
+}
+
+void cloakAndBurstWaitPopups(Dock& dock, int maxSteps = 26, HWND overflowHost = nullptr) {
+    ScopedHighResTimer hiRes;
+    const bool hasSaved = (dock.traySavedCursor.x != 0 || dock.traySavedCursor.y != 0);
+    RECT lockRc{dock.traySavedCursor.x, dock.traySavedCursor.y,
+                dock.traySavedCursor.x + 1, dock.traySavedCursor.y + 1};
+    for (int i = 0; i < maxSteps; ++i) {
+        if (overflowHost && IsWindow(overflowHost)) moveOverflowOffscreen(overflowHost, false);
+        if (dock.trayCursorLocked && hasSaved) ClipCursor(&lockRc);
+        if (hasSaved) {
+            POINT cur{};
+            if (GetCursorPos(&cur) && (cur.x != dock.traySavedCursor.x || cur.y != dock.traySavedCursor.y))
+                SetCursorPos(dock.traySavedCursor.x, dock.traySavedCursor.y);
+        }
+        adoptGuardDetectedMenu(dock);
+        fastScanAndCloakPopups(dock, (i % 4) == 0);
+        if (dock.trayCapturedMenuHwnd && IsWindowVisible(dock.trayCapturedMenuHwnd)) {
+            Sleep(2);
+            fastScanAndCloakPopups(dock, false);
+            break;
+        }
+        Sleep(1);
+    }
+    unlockTrayCursor(dock);
+}
+
+void triggerOffscreenContextMenu(Dock& dock, HWND hostWnd, IUIAutomationElement* target, bool useShiftF10 = false) {
+    ScopedHighResTimer hiRes;
+    const bool hostIsOverflow = hostWnd && isOverflowWindow(hostWnd);
+    if (hostIsOverflow) moveOverflowOffscreen(hostWnd, false);
+
+    const DWORD myTid = GetCurrentThreadId();
+    DWORD hostPid = 0;
+    const DWORD hostTid = hostWnd ? GetWindowThreadProcessId(hostWnd, &hostPid) : 0;
+    if (hostPid) AllowSetForegroundWindow(hostPid);
+    AllowSetForegroundWindow(ASFW_ANY);
+
+    const HWND prevFg = GetForegroundWindow();
+    const DWORD fgTid = prevFg ? GetWindowThreadProcessId(prevFg, nullptr) : 0;
+    bool attachedFg = false, attachedHost = false;
+    if (fgTid && fgTid != myTid) attachedFg = AttachThreadInput(myTid, fgTid, TRUE) != FALSE;
+    if (hostTid && hostTid != myTid && hostTid != fgTid)
+        attachedHost = AttachThreadInput(myTid, hostTid, TRUE) != FALSE;
+
+    if (hostWnd) SetForegroundWindow(hostWnd);
+    if (hostIsOverflow) moveOverflowOffscreen(hostWnd, false);
+
+    // Lock the system cursor to the exact 1x1 pixel where the user right-clicked BEFORE sending VK_APPS,
+    // so Explorer's XAML SystemTray compatibility shim can NEVER clamp SetCursorPos(-3950, -3950) to (0, 0),
+    // and tray apps calling GetCursorPos() receive the exact user click location.
+    if (dock.traySavedCursor.x != 0 || dock.traySavedCursor.y != 0) {
+        RECT lockRc{dock.traySavedCursor.x, dock.traySavedCursor.y,
+                    dock.traySavedCursor.x + 1, dock.traySavedCursor.y + 1};
+        if (ClipCursor(&lockRc)) dock.trayCursorLocked = true;
+    }
+    syncGuardCursorState(dock);
+    gGuardCloakMenus.store(true, std::memory_order_release);
+
+    if (target) {
+        target->SetFocus();
+        // Verify keyboard focus actually landed on the requested icon (1-2ms fast path, avoids firing on icon #0).
+        for (int wait = 0; wait < 14; ++wait) {
+            if (hostIsOverflow) moveOverflowOffscreen(hostWnd, false);
+            BOOL focused = FALSE;
+            if (SUCCEEDED(target->get_CurrentHasKeyboardFocus(&focused)) && focused) break;
+            if (wait == 5) {
+                if (hostWnd) SetForegroundWindow(hostWnd);
+                target->SetFocus();
+            }
+            Sleep(1);
+        }
+    } else {
+        Sleep(3);
+    }
+
+    if (hostIsOverflow) moveOverflowOffscreen(hostWnd, false);
+    if (dock.traySavedCursor.x != 0 || dock.traySavedCursor.y != 0) {
+        RECT lockRc{dock.traySavedCursor.x, dock.traySavedCursor.y,
+                    dock.traySavedCursor.x + 1, dock.traySavedCursor.y + 1};
+        if (ClipCursor(&lockRc)) dock.trayCursorLocked = true;
+    }
+
+    if (useShiftF10) sendShiftF10Key();
+    else sendContextMenuKey();
+
+    if (attachedHost) AttachThreadInput(myTid, hostTid, FALSE);
+    if (attachedFg) AttachThreadInput(myTid, fgTid, FALSE);
+
+    cloakAndBurstWaitPopups(dock, 26, hostIsOverflow ? hostWnd : nullptr);
 }
 }
 
@@ -2860,82 +3766,145 @@ Text Dock::trayMenuTitle() const {
     return title;
 }
 
-void Dock::pollDeferredTrayUncloak() {
-    if (gDeferredUncloakMenus.empty()) {
-        KillTimer(hwnd, 12);
-        return;
+float Dock::trayMenuSheetWidth() const {
+    size_t maxChars = trayMenuTitle().size() + 4;
+    for (const auto& item : currentTrayMenu()) {
+        if (item.separator) continue;
+        const size_t extraCols = (item.checked ? 3u : 0u) + (!item.children.empty() ? 3u : 0u);
+        maxChars = std::max(maxChars, item.label.size() + extraCols);
     }
-    const ULONGLONG nowTick = GetTickCount64();
-    for (auto it = gDeferredUncloakMenus.begin(); it != gDeferredUncloakMenus.end();) {
-        HWND w = it->hwnd;
-        if (!w || !IsWindow(w)) {
-            it = gDeferredUncloakMenus.erase(it);
-            continue;
-        }
-        if (!IsWindowVisible(w)) {
-            applyRestoreCloakedRecord(*it);
-            it = gDeferredUncloakMenus.erase(it);
-            continue;
-        }
-        // Still visible: keep it cloaked & retry dismiss cleanly; never uncloak visibly on-screen.
-        if (nowTick - it->dismissStartedAt > 120ULL && it->dismissRetries < 4) {
-            ++it->dismissRetries;
-            it->dismissStartedAt = nowTick;
-            if (isWin32MenuClass(w)) {
-                DWORD_PTR r = 0;
-                SendMessageTimeoutW(w, 0x01E6 /*MN_CANCELMENUS*/, 0, 0, SMTO_ABORTIFHUNG, 40, &r);
-            } else {
-                PostMessageW(w, WM_CANCELMODE, 0, 0);
-            }
-            PostMessageW(w, WM_KEYDOWN, VK_ESCAPE, 0);
-            PostMessageW(w, WM_KEYUP, VK_ESCAPE, 0);
-        } else if (it->dismissRetries >= 4 && nowTick - it->dismissStartedAt > 2500ULL) {
-            it = gDeferredUncloakMenus.erase(it);
-            continue;
-        }
-        ++it;
-    }
-    if (gDeferredUncloakMenus.empty()) KillTimer(hwnd, 12);
+    const float estimated = 72.f + static_cast<float>(maxChars) * 7.2f;
+    return std::clamp(estimated, 276.f, 360.f);
 }
 
-void Dock::stopTraySync(bool forceRestore) {
-    KillTimer(hwnd, 10);
+void Dock::pollDeferredTrayUncloak() {
+    // Also ensure any lingering Explorer overflow stays offscreen & hidden if it survived a dismiss
+    // or arrived late from a cancelled background chevron invoke.
+    const ULONGLONG nowWatch = GetTickCount64();
+    const bool watchingOverflow = nowWatch < gOverflowWatchUntil.load(std::memory_order_relaxed);
+    if (!trayBusy()) {
+        if (HWND lingeringOv = findVisibleOverflow()) {
+            dismissOverflowWindow(lingeringOv, panel);
+        }
+    }
+
+    std::vector<CloakedMenuRecord> toRestore;
+    bool anyLeft = false;
+    {
+        std::lock_guard lock(gCloakMutex);
+        if (gDeferredUncloakMenus.empty()) {
+            if (!watchingOverflow && !findVisibleOverflow()) KillTimer(hwnd, TrayUncloakTick);
+            return;
+        }
+        const ULONGLONG nowTick = GetTickCount64();
+        for (auto it = gDeferredUncloakMenus.begin(); it != gDeferredUncloakMenus.end();) {
+            HWND w = it->hwnd;
+            if (!w || !IsWindow(w)) {
+                it = gDeferredUncloakMenus.erase(it);
+                continue;
+            }
+            if (!IsWindowVisible(w)) {
+                toRestore.push_back(*it);
+                it = gDeferredUncloakMenus.erase(it);
+                continue;
+            }
+            if (it->executed) {
+                // Executed menu: NEVER send WM_CANCELMODE/VK_ESCAPE (would abort Quit/Exit or dialogs!).
+                if (nowTick - it->dismissStartedAt > 1800ULL) {
+                    it = gDeferredUncloakMenus.erase(it);
+                    continue;
+                }
+            } else {
+                // Cancelled capture menu: keep cloaked & retry dismiss cleanly; never uncloak visibly on-screen.
+                if (nowTick - it->dismissStartedAt > 100ULL && it->dismissRetries < 4) {
+                    ++it->dismissRetries;
+                    it->dismissStartedAt = nowTick;
+                    if (isWin32MenuClass(w)) {
+                        PostMessageW(w, 0x01E6 /*MN_CANCELMENUS*/, 0, 0);
+                    } else {
+                        PostMessageW(w, WM_CANCELMODE, 0, 0);
+                    }
+                    PostMessageW(w, WM_KEYDOWN, VK_ESCAPE, 0);
+                    PostMessageW(w, WM_KEYUP, VK_ESCAPE, 0);
+                } else if (it->dismissRetries >= 4 && nowTick - it->dismissStartedAt > 2000ULL) {
+                    it = gDeferredUncloakMenus.erase(it);
+                    continue;
+                }
+            }
+            ++it;
+        }
+        anyLeft = !gDeferredUncloakMenus.empty();
+    }
+    for (const auto& rec : toRestore) applyRestoreCloakedRecord(rec);
+    if (!anyLeft && !watchingOverflow && !findVisibleOverflow()) KillTimer(hwnd, TrayUncloakTick);
+}
+
+void Dock::stopTraySync(bool forceRestore, bool preserveExecutedPopup) {
+    KillTimer(hwnd, TraySyncTick);
+    unlockTrayCursor(*this);
+    const bool cancelledCapture = (trayAction == TrayAction::Capture);
     if (trayCaptureCancel) {
         trayCaptureCancel->store(true);
         trayCaptureCancel.reset();
     }
-    ++trayCaptureGen;
-    if (trayHook) {
-        UnhookWinEvent(trayHook);
-        trayHook = nullptr;
+    if (cancelledCapture && !forceRestore) {
+        gOverflowWatchUntil.store(GetTickCount64() + 300ULL, std::memory_order_relaxed);
     }
-    if (gTrayDock == this) gTrayDock = nullptr;
-    if (trayCapturedMenuHwnd && IsWindowVisible(trayCapturedMenuHwnd)) dismissPopupMenu(trayCapturedMenuHwnd);
-    while (!gCloakedMenus.empty()) {
-        HWND w = gCloakedMenus.back().hwnd;
-        if (!forceRestore && w && IsWindow(w) && IsWindowVisible(w)) {
-            dismissPopupMenu(w);
-        } else {
-            uncloakMenuWindow(w, forceRestore);
+    ++trayCaptureGen;
+
+    // 1. Handle captured / cloaked popup menus BEFORE disabling guard hooks.
+    if (preserveExecutedPopup) {
+        // Move all cloaked menus to deferred uncloak marked executed=true so we NEVER cancel the command!
+        std::vector<HWND> cloakedHwnds;
+        {
+            std::lock_guard lock(gCloakMutex);
+            for (const auto& r : gCloakedMenus) cloakedHwnds.push_back(r.hwnd);
+        }
+        for (HWND w : cloakedHwnds) uncloakMenuWindow(w, false, true);
+    } else {
+        if (trayCapturedMenuHwnd && IsWindowVisible(trayCapturedMenuHwnd)) {
+            dismissPopupMenu(trayCapturedMenuHwnd, !forceRestore);
+        }
+        for (;;) {
+            HWND w = nullptr;
+            {
+                std::lock_guard lock(gCloakMutex);
+                if (gCloakedMenus.empty()) break;
+                w = gCloakedMenus.back().hwnd;
+            }
+            if (!forceRestore && w && IsWindow(w) && IsWindowVisible(w)) {
+                dismissPopupMenu(w, true);
+            } else {
+                uncloakMenuWindow(w, forceRestore, false);
+            }
         }
     }
+
     if (forceRestore) {
-        KillTimer(hwnd, 12);
-        for (const auto& rec : gDeferredUncloakMenus) applyRestoreCloakedRecord(rec);
-        gDeferredUncloakMenus.clear();
-    } else if (!gDeferredUncloakMenus.empty() && hwnd) {
-        SetTimer(hwnd, 12, 30, nullptr);
+        KillTimer(hwnd, TrayUncloakTick);
+        std::vector<CloakedMenuRecord> deferred;
+        {
+            std::lock_guard lock(gCloakMutex);
+            deferred.swap(gDeferredUncloakMenus);
+        }
+        for (const auto& rec : deferred) applyRestoreCloakedRecord(rec);
     }
 
+    // 2. ALWAYS dismiss any visible Explorer overflow BEFORE turning off TrayGuard hooks!
+    HWND ovToClose = (trayOverflow && IsWindow(trayOverflow) && IsWindowVisible(trayOverflow))
+        ? trayOverflow : findVisibleOverflow();
+    if (!ovToClose) {
+        const HWND guardOv = gGuardLastOverflow.load(std::memory_order_acquire);
+        if (guardOv && IsWindow(guardOv) && IsWindowVisible(guardOv)) ovToClose = guardOv;
+    }
+    HWND fgRestore = (!preserveExecutedPopup && panel && !sheetClosing && IsWindowVisible(panel)) ? panel : nullptr;
+    if (ovToClose) {
+        dismissOverflowWindow(ovToClose, fgRestore);
+    }
     if (gRestoreLayered || gRestoreOverflowRgn) {
         HWND overflow = (gCloakedOverflow && IsWindow(gCloakedOverflow)) ? gCloakedOverflow : findAnyOverflow();
         if (overflow && IsWindow(overflow)) {
-            // Move offscreen and close FIRST so the overflow window NEVER flashes when restoring HRGN/EXSTYLE.
-            moveOverflowOffscreen(overflow);
-            if (IsWindowVisible(overflow)) {
-                PostMessageW(overflow, WM_CLOSE, 0, 0);
-                for (int w = 0; w < 7 && IsWindow(overflow) && IsWindowVisible(overflow); ++w) Sleep(5);
-            }
+            dismissOverflowWindow(overflow, fgRestore);
             if (IsWindow(overflow)) {
                 if (gRestoreOverflowRgn) SetWindowRgn(overflow, nullptr, FALSE);
                 if (gRestoreLayered) {
@@ -2947,10 +3916,21 @@ void Dock::stopTraySync(bool forceRestore) {
         gCloakedOverflow = nullptr;
         gRestoreLayered = false;
         gRestoreOverflowRgn = false;
-    } else if (trayOverflow && IsWindowVisible(trayOverflow)) {
-        moveOverflowOffscreen(trayOverflow);
-        PostMessageW(trayOverflow, WM_CLOSE, 0, 0);
     }
+
+    // 3. Remove hooks (and shut down guard thread cleanly on app exit).
+    removeTrayHooks(*this);
+    if (forceRestore) shutdownTrayGuard();
+
+    bool needDeferredTimer = false;
+    {
+        std::lock_guard lock(gCloakMutex);
+        needDeferredTimer = !gDeferredUncloakMenus.empty();
+    }
+    if (!forceRestore && (needDeferredTimer || cancelledCapture || findVisibleOverflow()) && hwnd) {
+        SetTimer(hwnd, TrayUncloakTick, 20, nullptr);
+    }
+
     trayAction = TrayAction::None;
     trayOverflow = nullptr;
     trayRightClickPending = false;
@@ -2966,6 +3946,8 @@ void Dock::stopTraySync(bool forceRestore) {
     trayPreWindows.clear();
     trayIgnoredPopups.clear();
     trayMenuOwnerPid = 0;
+    trayExpectedStem.clear();
+    traySavedCursor = {};
     trayPendingMenuIndex = -1;
     trayRightClickStartedAt = 0;
     if (panel && !sheetClosing) {
@@ -2983,6 +3965,13 @@ void Dock::showSystemTray(float x) {
     if (panel && page == SystemTray) {
         close();
         return;
+    }
+    if (trayIcons.empty()) {
+        std::lock_guard lock(gWarmupTrayMutex);
+        if (gWarmupTrayItems && !gWarmupTrayItems->empty()) {
+            trayIcons = std::move(*gWarmupTrayItems);
+            gWarmupTrayItems.reset();
+        }
     }
     trayMenuIconIndex = -1;
     trayPendingMenuIndex = -1;
@@ -3023,9 +4012,7 @@ void Dock::refreshSystemTray(bool forceReload) {
     if (taskbar) {
         DWORD explorerPid = 0;
         GetWindowThreadProcessId(taskbar, &explorerPid);
-        gTrayDock = this;
-        trayHook = SetWinEventHook(EVENT_OBJECT_CREATE, EVENT_OBJECT_LOCATIONCHANGE, nullptr,
-            trayWinEventProc, explorerPid, 0, WINEVENT_OUTOFCONTEXT);
+        installTrayHooks(*this, explorerPid);
         if (const HWND existing = FindWindowW(L"TopLevelWindowForOverflowXamlIsland", nullptr))
             moveOverflowOffscreen(existing);
     }
@@ -3034,17 +4021,20 @@ void Dock::refreshSystemTray(bool forceReload) {
     auto cancel = std::make_shared<std::atomic<bool>>(false);
     trayCaptureCancel = cancel;
     const HWND notify = hwnd;
+    const HWND panelWnd = panel;
     const HICON vetraIcon = appIcon;
+    const size_t existingCount = trayIcons.size();
     const auto stop = extra.proStop;
 
     try {
         trayCaptureRequest = std::async(std::launch::async,
-            [gen, cancel, stop, notify, taskbar, vetraIcon, forceReload]() -> TrayCaptureResult {
+            [gen, cancel, stop, notify, panelWnd, taskbar, vetraIcon, forceReload, existingCount]() -> TrayCaptureResult {
                 TrayCaptureResult res{};
                 res.generation = gen;
                 const auto aborted = [&]() { return cancel->load() || (stop && stop->load()); };
                 if (aborted()) return res;
 
+                ScopedHighResTimer hiRes;
                 const HRESULT comHr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
                 if (forceReload) {
                     std::lock_guard lock(gTrayCacheMutex);
@@ -3062,87 +4052,139 @@ void Dock::refreshSystemTray(bool forceReload) {
                 if (taskbar && !aborted()) {
                     ComPtr<IUIAutomation> uia = createUiaClient();
                     bool revealed = false;
-                    const auto waitForOverflow = [&](int maxMs) -> HWND {
-                        for (int waited = 0; waited < maxMs && !aborted(); waited += 15) {
-                            if (HWND ov = findVisibleOverflow()) return ov;
-                            Sleep(15);
+
+                    HANDLE readyEv = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+                    {
+                        std::lock_guard lock(gOverflowEventMutex);
+                        gOverflowReadyEvent = readyEv;
+                    }
+                    struct EventGuard {
+                        HANDLE ev;
+                        ~EventGuard() {
+                            {
+                                std::lock_guard lock(gOverflowEventMutex);
+                                if (gOverflowReadyEvent == ev) gOverflowReadyEvent = nullptr;
+                            }
+                            if (ev) CloseHandle(ev);
                         }
-                        return aborted() ? nullptr : findVisibleOverflow();
+                    } evGuard{readyEv};
+
+                    const auto waitForOverflow = [&](int maxMs) -> HWND {
+                        for (int waited = 0; waited < maxMs && !aborted(); waited += 3) {
+                            if (HWND ov = findVisibleOverflow()) {
+                                moveOverflowOffscreen(ov, false);
+                                return ov;
+                            }
+                            if (readyEv) WaitForSingleObject(readyEv, 3);
+                            else Sleep(3);
+                        }
+                        if (aborted()) return nullptr;
+                        HWND ov = findVisibleOverflow();
+                        if (ov) moveOverflowOffscreen(ov, false);
+                        return ov;
                     };
 
                     HWND overflow = findVisibleOverflow();
-                    if (!overflow && uia && !aborted()) {
-                        if (invokeTrayOverflowWithUia(uia.Get(), taskbar, false))
-                            overflow = waitForOverflow(120);
-                    }
+                    bool invokedOverflow = false;
                     if (!overflow && !aborted()) {
+                        if (!forceReload) {
+                            if (const HWND cachedOv = FindWindowW(L"TopLevelWindowForOverflowXamlIsland", nullptr)) {
+                                moveOverflowOffscreen(cachedOv, false);
+                            }
+                        }
+
                         if (!IsWindowVisible(taskbar)) {
                             cloakTaskbarForTempReveal(taskbar);
+                            gGuardHideTaskbar.store(true, std::memory_order_relaxed);
                             ShowWindowAsync(taskbar, SW_SHOWNOACTIVATE);
                             revealed = true;
-                            Sleep(25);
+                            Sleep(8);
                         }
-                        if (uia && invokeTrayOverflowWithUia(uia.Get(), taskbar, true))
-                            overflow = waitForOverflow(180);
-                        if (!overflow && uia && !aborted() && invokeTrayOverflowWithUia(uia.Get(), taskbar, true))
-                            overflow = waitForOverflow(120);
-                        if (!overflow && !aborted() && invokeViaWinBWithUia(uia.Get(), taskbar))
-                            overflow = waitForOverflow(150);
+                        if (readyEv) ResetEvent(readyEv);
+                        if (uia && invokeTrayOverflowWithUia(uia.Get(), taskbar, true)) {
+                            invokedOverflow = true;
+                            overflow = waitForOverflow(100);
+                        }
+                        if (!overflow && uia && !aborted() && invokeTrayOverflowWithUia(uia.Get(), taskbar, false)) {
+                            invokedOverflow = true;
+                            overflow = waitForOverflow(80);
+                        }
+                        if (!overflow && !aborted() && invokeViaWinBWithUia(uia.Get(), taskbar)) {
+                            invokedOverflow = true;
+                            overflow = waitForOverflow(100);
+                        }
+                    }
+                    // If capture was aborted mid-flight after invoking chevron and no new tray action took over,
+                    // catch & dismiss the delayed overflow so it NEVER flashes on-screen on the right!
+                    if (invokedOverflow && aborted() && !gGuardEnabled.load(std::memory_order_acquire)) {
+                        for (int w = 0; w < 20 && !gGuardEnabled.load(std::memory_order_acquire); ++w) {
+                            if (HWND lateOv = findVisibleOverflow()) {
+                                dismissOverflowWindow(lateOv, nullptr);
+                                break;
+                            }
+                            Sleep(5);
+                        }
                     }
 
                     std::vector<OverflowButton> allButtons;
                     std::vector<std::shared_ptr<Gdiplus::Bitmap>> allBitmaps;
+                    std::vector<NotifyIconEntry> regEntries = cachedNotifyIconRegistry(forceReload);
+                    bool regRefreshed = forceReload;
+
+                    const auto canResolveWithoutPrint = [&](const Text& btnName) -> bool {
+                        if (forceReload || btnName.empty()) return false;
+                        if (lookupCachedTrayIcon(btnName)) return true;
+                        const NotifyIconEntry* reg = matchNotifyRegistry(regEntries, btnName);
+                        if (!reg && !regRefreshed) {
+                            regEntries = cachedNotifyIconRegistry(true);
+                            regRefreshed = true;
+                            reg = matchNotifyRegistry(regEntries, btnName);
+                        }
+                        if (!reg) return false;
+                        if (isDynamicStatusTrayIcon(toLowerText(btnName.c_str()), reg->exeStemLower))
+                            return false;
+                        return reg->pngBytes > 24 || reg->exeExists;
+                    };
 
                     if (overflow && !aborted()) {
-                        moveOverflowOffscreen(overflow);
+                        moveOverflowOffscreen(overflow, false);
                         if (revealed) {
                             ShowWindowAsync(taskbar, SW_HIDE);
                             res.revealedTaskbar = true;
                         }
-                        RECT prevRc{};
-                        GetWindowRect(overflow, &prevRc);
-                        Sleep(35);
-                        for (int settle = 0; settle < 4 && !aborted(); ++settle) {
-                            RECT curRc{};
-                            if (GetWindowRect(overflow, &curRc) && EqualRect(&curRc, &prevRc) && !IsRectEmpty(&curRc))
-                                break;
-                            prevRc = curRc;
-                            Sleep(18);
-                        }
 
-                        // Wait until XAML finishes realizing all buttons (two consecutive equal counts).
                         std::vector<OverflowButton> buttons;
-                        for (int tries = 0; tries < 8 && !aborted(); ++tries) {
+                        for (int tries = 0; tries < 10 && !aborted(); ++tries) {
                             buttons = collectOverflowButtonsWithUia(uia.Get(), overflow);
                             if (!buttons.empty()) break;
-                            Sleep(20);
+                            Sleep(6);
                         }
-                        for (int stab = 0; stab < 4 && !buttons.empty() && !aborted(); ++stab) {
-                            Sleep(24);
+                        // Only wait a second tick if we have no prior baseline or fewer buttons than expected.
+                        if (!buttons.empty() && !aborted() && (existingCount == 0 || buttons.size() < existingCount)) {
+                            Sleep(8);
                             auto next = collectOverflowButtonsWithUia(uia.Get(), overflow);
-                            if (next.size() <= buttons.size()) break;
-                            buttons = std::move(next);
+                            if (next.size() > buttons.size()) {
+                                buttons = std::move(next);
+                                Sleep(8);
+                                auto next2 = collectOverflowButtonsWithUia(uia.Get(), overflow);
+                                if (next2.size() > buttons.size()) buttons = std::move(next2);
+                            }
                         }
 
                         if (!buttons.empty() && !aborted()) {
-                            auto scroller = findOverflowVerticalScroller(uia.Get(), overflow);
+                            ComPtr<IUIAutomationScrollPattern> scroller;
+                            if (buttons.size() >= 12) {
+                                scroller = findOverflowVerticalScroller(uia.Get(), overflow);
+                            }
                             if (scroller) {
-                                // Overflow has more icons than its visible viewport: walk scroll offsets
-                                // so virtualized / clipped rows are realized and captured cleanly.
                                 scroller->SetScrollPercent(UIA_ScrollPatternNoScroll, 0.0);
-                                Sleep(25);
+                                Sleep(12);
                                 double lastPct = -1.0;
                                 for (int step = 0; step < 8 && !aborted(); ++step) {
                                     auto pageBtns = collectOverflowButtonsWithUia(uia.Get(), overflow);
-                                    bool pageNeedsPrint = forceReload;
-                                    if (!pageNeedsPrint) {
-                                        for (const auto& b : pageBtns) {
-                                            if (isDynamicStatusTrayIcon(toLowerText(b.name.c_str()), {}) ||
-                                                !lookupCachedTrayIcon(b.name)) {
-                                                pageNeedsPrint = true;
-                                                break;
-                                            }
-                                        }
+                                    bool pageNeedsPrint = false;
+                                    for (const auto& b : pageBtns) {
+                                        if (!canResolveWithoutPrint(b.name)) { pageNeedsPrint = true; break; }
                                     }
                                     std::vector<std::shared_ptr<Gdiplus::Bitmap>> pageBmps;
                                     if (pageNeedsPrint && !pageBtns.empty()) {
@@ -3166,36 +4208,31 @@ void Dock::refreshSystemTray(bool forceReload) {
                                     if (FAILED(scroller->Scroll(ScrollAmount_NoAmount, ScrollAmount_LargeIncrement))) {
                                         scroller->SetScrollPercent(UIA_ScrollPatternNoScroll, std::min(100.0, curPct + 35.0));
                                     }
-                                    Sleep(30);
+                                    Sleep(14);
                                 }
                                 scroller->SetScrollPercent(UIA_ScrollPatternNoScroll, 0.0);
                             } else {
-                                bool needPrintWindow = forceReload;
-                                if (!needPrintWindow) {
-                                    for (const auto& b : buttons) {
-                                        const Text low = toLowerText(b.name.c_str());
-                                        if (isDynamicStatusTrayIcon(low, {}) || !lookupCachedTrayIcon(b.name)) {
-                                            needPrintWindow = true;
-                                            break;
-                                        }
-                                    }
+                                bool needPrintWindow = false;
+                                for (const auto& b : buttons) {
+                                    if (!canResolveWithoutPrint(b.name)) { needPrintWindow = true; break; }
                                 }
                                 if (needPrintWindow) {
                                     for (int tries = 0; tries < 4 && !aborted(); ++tries) {
                                         if (captureOverflowIcons(overflow, buttons, allBitmaps)) break;
-                                        Sleep(20);
+                                        Sleep(8);
                                     }
                                 }
                                 allButtons = std::move(buttons);
                                 if (allBitmaps.size() < allButtons.size()) allBitmaps.resize(allButtons.size());
                             }
                         }
-                        // Dismiss overflow immediately once pixels/buttons are read.
-                        PostMessageW(overflow, WM_CLOSE, 0, 0);
+                        // Only dismiss overflow if this capture wasn't cancelled by an active user click/right-click!
+                        if (!aborted()) {
+                            dismissOverflowWindow(overflow, panelWnd);
+                        }
                     }
 
-                    // Also include any notification icons promoted directly onto the Windows taskbar
-                    // (otherwise invisible whenever Vetra hides Shell_TrayWnd).
+                    // Also include any notification icons promoted directly onto the Windows taskbar.
                     if (uia && !aborted()) {
                         auto promoted = collectPromotedTaskbarButtonsWithUia(uia.Get(), taskbar);
                         for (auto& pBtn : promoted) {
@@ -3212,18 +4249,11 @@ void Dock::refreshSystemTray(bool forceReload) {
                     }
 
                     if (!allButtons.empty() && !aborted()) {
-                        std::vector<NotifyIconEntry> regEntries;
-                        bool regLoaded = false;
-                        bool regRefreshed = forceReload;
                         res.items.reserve(allButtons.size());
                         for (size_t i = 0; i < allButtons.size() && !aborted(); ++i) {
                             auto captured = (i < allBitmaps.size()) ? allBitmaps[i] : nullptr;
                             std::shared_ptr<Gdiplus::Bitmap> icon = forceReload ? nullptr : lookupCachedTrayIcon(allButtons[i].name);
                             if (!icon) {
-                                if (!regLoaded) {
-                                    regEntries = cachedNotifyIconRegistry(forceReload);
-                                    regLoaded = true;
-                                }
                                 if (!regRefreshed && !matchNotifyRegistry(regEntries, allButtons[i].name)) {
                                     regEntries = cachedNotifyIconRegistry(true);
                                     regRefreshed = true;
@@ -3255,6 +4285,23 @@ void Dock::refreshSystemTray(bool forceReload) {
 }
 
 void Dock::pollTrayCapture() {
+    if (trayIcons.empty() && !trayBusy()) {
+        std::vector<TrayItem> warmed;
+        {
+            std::lock_guard lock(gWarmupTrayMutex);
+            if (gWarmupTrayItems && !gWarmupTrayItems->empty()) {
+                warmed = std::move(*gWarmupTrayItems);
+                gWarmupTrayItems.reset();
+            }
+        }
+        if (!warmed.empty()) {
+            trayIcons = std::move(warmed);
+            trayLoading = false;
+            if (panel && page == SystemTray && !sheetClosing && trayMenuIconIndex < 0 && trayPendingMenuIndex < 0)
+                positionSheet();
+        }
+    }
+
     if (!trayCaptureRequest.valid() ||
         trayCaptureRequest.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
         return;
@@ -3265,11 +4312,13 @@ void Dock::pollTrayCapture() {
 
     if (res.generation != trayCaptureGen) return;
     if (trayAction == TrayAction::Capture) {
-        if (trayHook) {
-            UnhookWinEvent(trayHook);
-            trayHook = nullptr;
+        if (HWND ov = findVisibleOverflow()) dismissOverflowWindow(ov, panel);
+        if (!res.passiveWarmup && panel && page == SystemTray && !sheetClosing) {
+            const HWND fg = GetForegroundWindow();
+            if (!fg || isOverflowWindow(fg) || fg == FindWindowW(L"Shell_TrayWnd", nullptr))
+                forceForegroundWindow(panel);
         }
-        if (gTrayDock == this) gTrayDock = nullptr;
+        removeTrayHooks(*this);
         trayAction = TrayAction::None;
         trayCaptureCancel.reset();
     }
@@ -3278,24 +4327,35 @@ void Dock::pollTrayCapture() {
     if (res.ok) {
         const auto oldGrid = trayGridLayout();
         const bool wasEmpty = trayIcons.empty();
+        bool listChanged = res.items.size() != trayIcons.size();
+        if (!listChanged) {
+            for (size_t i = 0; i < res.items.size(); ++i) {
+                if (res.items[i].name != trayIcons[i].name ||
+                    res.items[i].onTaskbar != trayIcons[i].onTaskbar ||
+                    (!trayIcons[i].icon && res.items[i].icon)) {
+                    listChanged = true;
+                    break;
+                }
+            }
+        }
         trayIcons = std::move(res.items);
         const auto newGrid = trayGridLayout();
         const bool dimsChanged = wasEmpty || oldGrid.cols != newGrid.cols || oldGrid.visibleRows != newGrid.visibleRows;
         trayLoading = false;
-        if (panel && page == SystemTray && !sheetClosing && trayMenuIconIndex < 0) {
+        if (!res.passiveWarmup && panel && page == SystemTray && !sheetClosing && trayMenuIconIndex < 0 && trayPendingMenuIndex < 0) {
             if (dimsChanged) {
                 triggerSheetContentAnim(0.f, 5.f);
                 positionSheet();
-            } else {
+            } else if (listChanged) {
                 paintSheet();
             }
             const HWND fg = GetForegroundWindow();
             if (!fg || isOverflowWindow(fg) || fg == FindWindowW(L"Shell_TrayWnd", nullptr))
                 SetForegroundWindow(panel);
         }
-    } else {
+    } else if (!res.passiveWarmup) {
         trayLoading = false;
-        if (panel && page == SystemTray && !sheetClosing && trayMenuIconIndex < 0) paintSheet();
+        if (panel && page == SystemTray && !sheetClosing && trayMenuIconIndex < 0 && trayPendingMenuIndex < 0) paintSheet();
     }
 }
 
@@ -3303,9 +4363,87 @@ void Dock::prewarmTrayCaches() {
     if (trayWarmupDone) return;
     trayWarmupDone = true;
     const auto stop = extra.proStop;
-    std::thread([stop] {
-        SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
-        if (!stop || !stop->load()) cachedNotifyIconRegistry(false);
+    const HWND notify = hwnd;
+    const HICON vetraIcon = appIcon;
+
+    std::thread([stop, notify, vetraIcon]() {
+        ScopedBackgroundPriority bgPriority;
+        if (stop && stop->load()) return;
+
+        const HRESULT comHr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        const auto regEntries = cachedNotifyIconRegistry(false);
+
+        // Snapshot currently running process stems (~0.4ms) and pre-decode/cache their HD tray icons
+        // so opening Gizli simgeler has zero icon decoding or shell:AppsFolder enumeration latency.
+        std::unordered_set<Text> runningStems;
+        const HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (snap != INVALID_HANDLE_VALUE) {
+            PROCESSENTRY32W pe{sizeof(pe)};
+            if (Process32FirstW(snap, &pe)) {
+                do {
+                    runningStems.insert(fileStemLower(pe.szExeFile));
+                } while (Process32NextW(snap, &pe));
+            }
+            CloseHandle(snap);
+        }
+
+        bool needsAppsFolder = false;
+        for (const auto& e : regEntries) {
+            if (stop && stop->load()) break;
+            if (e.exeStemLower.empty() || !runningStems.contains(e.exeStemLower)) continue;
+            if (toLowerText(e.exePath.c_str()).find(L"\\windowsapps\\") != Text::npos)
+                needsAppsFolder = true;
+            const Text cacheKey = !e.tip.empty() ? e.tip : e.exeStemLower;
+            if (!lookupCachedTrayIcon(cacheKey)) {
+                if (auto bmp = resolveCrispTrayIcon(cacheKey, vetraIcon, regEntries, nullptr))
+                    storeCachedTrayIcon(cacheKey, bmp);
+            }
+        }
+        if (needsAppsFolder && (!stop || !stop->load())) {
+            lookupAppsFolderIdByPfn(L"_warmup_");
+        }
+
+        // Passively populate tray icon list without opening any window or changing foreground if Explorer
+        // already has a classic toolbar or an already-realized XAML overflow island.
+        std::vector<TrayItem> passiveItems;
+        if (!stop || !stop->load()) {
+            if (!tryCaptureClassicTray(passiveItems, false)) {
+                if (const HWND cachedOv = FindWindowW(L"TopLevelWindowForOverflowXamlIsland", nullptr)) {
+                    moveOverflowOffscreen(cachedOv);
+                    ComPtr<IUIAutomation> uia = createUiaClient();
+                    if (uia) {
+                        auto buttons = collectOverflowButtonsWithUia(uia.Get(), cachedOv, true);
+                        if (const HWND tb = FindWindowW(L"Shell_TrayWnd", nullptr)) {
+                            for (auto& pBtn : collectPromotedTaskbarButtonsWithUia(uia.Get(), tb)) {
+                                const Text pLow = toLowerText(pBtn.name.c_str());
+                                const bool dup = std::any_of(buttons.begin(), buttons.end(), [&](const OverflowButton& b) {
+                                    return toLowerText(b.name.c_str()) == pLow;
+                                });
+                                if (!dup) buttons.push_back(std::move(pBtn));
+                            }
+                        }
+                        for (const auto& b : buttons) {
+                            if (stop && stop->load()) break;
+                            auto icon = lookupCachedTrayIcon(b.name);
+                            if (!icon) {
+                                icon = resolveCrispTrayIcon(b.name, vetraIcon, regEntries, nullptr);
+                                storeCachedTrayIcon(b.name, icon);
+                            }
+                            passiveItems.push_back({b.name, std::move(icon), nullptr, 0, 0, b.onTaskbar});
+                        }
+                    }
+                }
+            }
+        }
+
+        if (SUCCEEDED(comHr)) CoUninitialize();
+        if (!passiveItems.empty() && (!stop || !stop->load())) {
+            {
+                std::lock_guard lock(gWarmupTrayMutex);
+                gWarmupTrayItems = std::move(passiveItems);
+            }
+            if (notify) PostMessageW(notify, AsyncWake, 0, 0);
+        }
     }).detach();
 }
 
@@ -3319,9 +4457,11 @@ void Dock::activateTrayIcon(int index, bool rightClick, POINT screenPt) {
     }
 
     if (rightClick) {
-        // Elevated SYSTEM-owned tray icons (NVIDIA, Monster) cannot be cloaked cross-process due to UIPI.
+        // Elevated SYSTEM-owned / kernel self-protected tray icons (NVIDIA, Monster, Kaspersky)
+        // cannot be cloaked cross-process due to UIPI / self-defense; render instant native menus.
         std::vector<TrayMenuItem> fastMenu = buildNvidiaTrayMenu(item.name);
         if (fastMenu.empty() && containsCI(item.name.c_str(), L"monster")) fastMenu = buildMonsterControlMenu();
+        if (fastMenu.empty() && containsCI(item.name.c_str(), L"kaspersky")) fastMenu = buildKasperskyMenu(item.name);
         if (!fastMenu.empty()) {
             stopTraySync();
             trayMenuIconIndex = index;
@@ -3353,12 +4493,32 @@ void Dock::activateTrayIcon(int index, bool rightClick, POINT screenPt) {
 
 void Dock::startTrayIconAction(int index, TrayAction action, POINT screenPt) {
     const auto& item = trayIcons[index];
-    stopTraySync();
+    // If background capture already has the overflow open offscreen, cancel capture cleanly
+    // WITHOUT closing the overflow so this right-click/left-click reuses it with 0ms latency!
+    const bool reuseOpenOverflow = (trayAction == TrayAction::Capture) && !item.onTaskbar && (findVisibleOverflow() != nullptr);
+    if (reuseOpenOverflow) {
+        KillTimer(hwnd, TraySyncTick);
+        if (trayCaptureCancel) {
+            trayCaptureCancel->store(true);
+            trayCaptureCancel.reset();
+        }
+        ++trayCaptureGen;
+        trayAction = TrayAction::None;
+    } else {
+        stopTraySync();
+    }
+
+    if (action == TrayAction::ExecuteMenu && trayLastPopupHwnd) {
+        clearDeferredUncloakFor(trayLastPopupHwnd);
+    }
+
+    if (!GetCursorPos(&traySavedCursor)) traySavedCursor = screenPt;
+    trayCursorLocked = false;
     trayAction = action;
     trayActionIndex = index;
     trayActionName = item.name;
     trayActionOnTaskbar = item.onTaskbar;
-    trayActionPoint = screenPt;
+    trayActionPoint = (screenPt.x != 0 || screenPt.y != 0) ? screenPt : traySavedCursor;
     trayLocalOffset = {};
     trayCaptureTries = 0;
     trayPopupSeenTries = 0;
@@ -3370,10 +4530,13 @@ void Dock::startTrayIconAction(int index, TrayAction action, POINT screenPt) {
     trayOverflowSettled = false;
     trayLastOvRect = {};
     trayCapturedMenuHwnd = nullptr;
+    trayExpectedStem.clear();
+    if (const auto* reg = matchNotifyRegistry(cachedNotifyIconRegistry(false), trayActionName)) {
+        trayExpectedStem = reg->exeStemLower;
+    }
     trayRightClickStartedAt = GetTickCount64();
 
     if (action == TrayAction::RightClickMenu) {
-        // Keep the icon grid steady while capturing so Vetra's panel never flashes/resizes twice.
         trayPendingMenuIndex = index;
         trayMenuPath.clear();
         trayMenuLoading = false;
@@ -3381,28 +4544,48 @@ void Dock::startTrayIconAction(int index, TrayAction action, POINT screenPt) {
         trayMenuItems.clear();
         trayLastPopupHwnd = nullptr;
         listOffset = 0;
+        if (panel && page == SystemTray) paintSheet();
     } else if (action == TrayAction::LeftClick) {
         close();
     }
 
-    gTrayDock = this;
-    trayHook = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_OBJECT_LOCATIONCHANGE, nullptr,
-        trayWinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT);
+    installTrayHooks(*this, 0);
+
+    const auto tryCompleteImmediateCapture = [&]() -> bool {
+        adoptGuardDetectedMenu(*this);
+        if (action == TrayAction::RightClickMenu && trayCapturedMenuHwnd && IsWindowVisible(trayCapturedMenuHwnd)) {
+            auto items = extractPopupMenuItems(trayCapturedMenuHwnd);
+            if (!items.empty()) {
+                trayLastPopupHwnd = trayCapturedMenuHwnd;
+                trayMenuItems = std::move(items);
+                finishTrayMenu();
+                return true;
+            }
+        } else if (action == TrayAction::ExecuteMenu && trayCapturedMenuHwnd && IsWindowVisible(trayCapturedMenuHwnd)) {
+            if (invokePopupMenuItem(trayCapturedMenuHwnd, trayPendingExec, trayMenuItems)) {
+                finishTrayMenu(true);
+                return true;
+            }
+        }
+        return false;
+    };
 
     if (action != TrayAction::LeftClick && IsWindow(item.targetHwnd)) {
         if (panel && action == TrayAction::ExecuteMenu) {
             const LONG_PTR pex = GetWindowLongPtrW(panel, GWL_EXSTYLE);
             SetWindowLongPtrW(panel, GWL_EXSTYLE, pex | WS_EX_TRANSPARENT);
         }
-        snapshotTrayPreWindows(*this);
         GetWindowThreadProcessId(item.targetHwnd, &trayMenuOwnerPid);
+        snapshotTrayPreWindows(*this);
         AllowSetForegroundWindow(trayMenuOwnerPid);
-        trayNativeClick = screenPt;
+        trayNativeClick = trayActionPoint;
         trayRightClickStep = 2;
         trayRightClickPending = true;
+        gGuardCloakMenus.store(true, std::memory_order_release);
         if (PostMessageW(item.targetHwnd, item.callbackMsg, item.uid, WM_RBUTTONUP)) {
-            microBurstCloakPopups(*this, 36);
-            if (SetTimer(hwnd, 10, 10, nullptr)) return;
+            cloakAndBurstWaitPopups(*this, 26);
+            if (tryCompleteImmediateCapture()) return;
+            if (SetTimer(hwnd, TraySyncTick, 10, nullptr)) return;
         }
         finishTrayMenu();
         return;
@@ -3413,6 +4596,13 @@ void Dock::startTrayIconAction(int index, TrayAction action, POINT screenPt) {
 
     // Promoted taskbar tray icons live directly on Shell_TrayWnd (no need to open overflow).
     if (trayActionOnTaskbar) {
+        if (!IsWindowVisible(taskbar)) {
+            trayNeedsReveal = true;
+            gGuardHideTaskbar.store(true, std::memory_order_relaxed);
+            shellTaskbar.revealPrimary(true);
+            ScopedHighResTimer hiRes;
+            Sleep(6);
+        }
         auto promoted = collectPromotedTaskbarButtonsWithUia(sharedUia(), taskbar);
         RECT btnRect{};
         auto target = matchOverflowButton(promoted, trayActionName, -1, btnRect);
@@ -3427,31 +4617,51 @@ void Dock::startTrayIconAction(int index, TrayAction action, POINT screenPt) {
             trayUsedKeyboardMenu = true;
             trayRightClickStep = 2;
             trayCaptureTries = 0;
-            trayNativeClick = {(btnRect.left + btnRect.right) / 2, (btnRect.top + btnRect.bottom) / 2};
-            SetForegroundWindow(taskbar);
-            target->SetFocus();
-            Sleep(10);
-            sendContextMenuKey();
-            microBurstCloakPopups(*this, 36);
-            if (SetTimer(hwnd, 10, 10, nullptr)) return;
+            trayNativeClick = trayActionPoint;
+            if (panel && action == TrayAction::ExecuteMenu) {
+                const LONG_PTR pex = GetWindowLongPtrW(panel, GWL_EXSTYLE);
+                SetWindowLongPtrW(panel, GWL_EXSTYLE, pex | WS_EX_TRANSPARENT);
+            }
+            triggerOffscreenContextMenu(*this, taskbar, target.Get(), false);
+            if (trayNeedsReveal && IsWindowVisible(taskbar)) ShowWindowAsync(taskbar, SW_HIDE);
+            if (tryCompleteImmediateCapture()) return;
+            if (SetTimer(hwnd, TraySyncTick, 10, nullptr)) return;
             finishTrayMenu();
             return;
         }
     }
 
     if (const HWND existing = FindWindowW(L"TopLevelWindowForOverflowXamlIsland", nullptr))
-        moveOverflowOffscreen(existing);
+        moveOverflowOffscreen(existing, false);
 
     if (findVisibleOverflow()) {
         updateTraySync();
         return;
     }
 
-    if (!invokeTrayOverflow(taskbar, false)) {
+    // Reveal cloaked taskbar immediately if hidden so overflow opens in ~10ms.
+    if (!IsWindowVisible(taskbar)) {
         trayNeedsReveal = true;
+        gGuardHideTaskbar.store(true, std::memory_order_relaxed);
         shellTaskbar.revealPrimary(true);
+        ScopedHighResTimer hiRes;
+        Sleep(6);
+        invokeTrayOverflow(taskbar, true);
+    } else if (!invokeTrayOverflow(taskbar, true)) {
+        invokeTrayOverflow(taskbar, false);
     }
-    if (!SetTimer(hwnd, 10, 16, nullptr)) finishTrayMenu();
+
+    // Fast inline wait (~24ms); TrayGuard thread stays live and pins overflow offscreen instantaneously!
+    {
+        ScopedHighResTimer hiRes;
+        for (int w = 0; w < 8 && !findVisibleOverflow(); ++w) Sleep(3);
+    }
+    if (HWND ov = findVisibleOverflow()) {
+        moveOverflowOffscreen(ov, false);
+        updateTraySync();
+        return;
+    }
+    if (!SetTimer(hwnd, TraySyncTick, 10, nullptr)) finishTrayMenu();
 }
 
 void Dock::executeTrayMenuItem(const TrayMenuItem& item) {
@@ -3487,7 +4697,7 @@ void Dock::executeTrayMenuItem(const TrayMenuItem& item) {
 
     const int idx = trayMenuIconIndex;
     POINT clickPt = trayActionPoint;
-    if (panel) {
+    if (!GetCursorPos(&clickPt) && panel) {
         RECT pr{};
         if (GetWindowRect(panel, &pr)) {
             clickPt = {(pr.left + pr.right) / 2, (pr.top + pr.bottom) / 2};
@@ -3511,12 +4721,17 @@ void Dock::finishTrayMenu(bool executed) {
                 trayMenuUnavailable = true;
                 TrayMenuItem openItem{};
                 openItem.label = L"Uygulamayı aç";
+                openItem.rawMenuIndex = -1;
                 trayMenuItems.push_back(std::move(openItem));
             }
         }
     }
     trayMenuLoading = false;
-    stopTraySync();
+    // Guard against transient WA_INACTIVE closing Vetra's panel while foreground returns from overflow/menu.
+    const bool keepSheet = (capture || (execute && !executed)) && panel && page == SystemTray && !sheetClosing;
+    const bool prevOpening = openingSheet;
+    if (keepSheet) openingSheet = true;
+    stopTraySync(false, execute && executed);
     if (execute && executed) {
         trayMenuIconIndex = -1;
         trayMenuPath.clear();
@@ -3524,14 +4739,15 @@ void Dock::finishTrayMenu(bool executed) {
         trayLastPopupHwnd = nullptr;
         close();
     }
-    if ((capture || execute) && panel && page == SystemTray && !sheetClosing) {
+    if (keepSheet) {
         sheet.resetMotion();
         menuHoverVisible = false;
         menuHoverY.initialized = false;
         if (capture) triggerSheetContentAnim(16.f, 0.f);
         positionSheet();
-        SetForegroundWindow(panel);
-        if (execute && !executed) report(L"Menü komutu yeniden açılamadı.");
+        forceForegroundWindow(panel);
+        if (execute && !executed) report(L"Menü komutu çalıştırılamadı.");
+        openingSheet = prevOpening;
     }
 }
 
@@ -3561,7 +4777,7 @@ void Dock::updateTraySync() {
         explicit SyncGuard(bool& f) : flag(f) { flag = true; }
         ~SyncGuard() { flag = false; }
     } syncGuard(gInTraySync);
-    KillTimer(hwnd, 10);
+    KillTimer(hwnd, TraySyncTick);
     if (trayAction == TrayAction::None) { stopTraySync(); return; }
 
     // Only show "Menü yükleniyor…" if capture genuinely takes >260ms, avoiding any brief resize flash.
@@ -3576,6 +4792,7 @@ void Dock::updateTraySync() {
     }
 
     const HWND overflow = findVisibleOverflow();
+    if (overflow) moveOverflowOffscreen(overflow, false);
     if ((trayAction == TrayAction::RightClickMenu || trayAction == TrayAction::ExecuteMenu) && trayRightClickStep > 0) {
         if (trayRightClickStep == 4) {
             const bool done = !trayCapturedMenuHwnd || !IsWindowVisible(trayCapturedMenuHwnd) ||
@@ -3583,86 +4800,10 @@ void Dock::updateTraySync() {
             finishTrayMenu(done);
             return;
         }
-        if (trayRightClickStep == 1) {
-            // Fallback corner mouse right-click (only reached if a legacy tray app ignored VK_APPS).
-            if (!overflow) { finishTrayMenu(); return; }
-            RECT ovRect{};
-            if (!GetWindowRect(overflow, &ovRect)) { finishTrayMenu(); return; }
-            int localX = trayLocalOffset.x;
-            int localY = trayLocalOffset.y;
-            const auto curButtons = collectOverflowButtons(overflow);
-            RECT curBtnRect{};
-            if (matchOverflowButton(curButtons, trayActionName, trayActionIndex, curBtnRect)) {
-                localX = (curBtnRect.left + curBtnRect.right) / 2 - ovRect.left;
-                localY = (curBtnRect.top + curBtnRect.bottom) / 2 - ovRect.top;
-                trayLocalOffset = {localX, localY};
-            }
-
-            // Anchor ONLY the 1x1 target pixel at the extreme bottom-right corner of the monitor
-            // so 99.9% of the overflow XAML island remains physically off-monitor.
-            POINT cornerClick = trayActionPoint;
-            if (const HMONITOR mon = MonitorFromPoint(trayActionPoint, MONITOR_DEFAULTTONEAREST)) {
-                MONITORINFO mi{sizeof(mi)};
-                if (GetMonitorInfoW(mon, &mi)) {
-                    cornerClick = {mi.rcMonitor.right - 2, mi.rcMonitor.bottom - 2};
-                }
-            }
-            const int targetX = cornerClick.x - localX;
-            const int targetY = cornerClick.y - localY;
-
-            gCloakedOverflow = overflow;
-            if (HRGN clip = CreateRectRgn(localX, localY, localX + 1, localY + 1)) {
-                if (SetWindowRgn(overflow, clip, FALSE)) gRestoreOverflowRgn = true;
-                else DeleteObject(clip);
-            }
-            const LONG_PTR ex = GetWindowLongPtrW(overflow, GWL_EXSTYLE);
-            constexpr LONG_PTR kNoRedir = 0x00200000L;
-            if ((ex & kNoRedir) == 0 && !gRestoreLayered) {
-                gOrigExStyle = ex;
-                gRestoreLayered = true;
-                SetWindowLongPtrW(overflow, GWL_EXSTYLE, ex | WS_EX_LAYERED);
-                SetLayeredWindowAttributes(overflow, 0, 1, LWA_ALPHA);
-            }
-
-            snapshotTrayPreWindows(*this);
-            trayRightClickPending = true;
-            trayCapturedMenuHwnd = nullptr;
-            trayPopupSeenTries = 0;
-            trayNativeClick = cornerClick;
-
-            SetWindowPos(overflow, HWND_TOPMOST, targetX, targetY, 0, 0,
-                SWP_NOSIZE | SWP_SHOWWINDOW | SWP_NOSENDCHANGING);
-            SetForegroundWindow(overflow);
-
-            POINT prevCursor{};
-            GetCursorPos(&prevCursor);
-            SetCursorPos(cornerClick.x, cornerClick.y);
-            INPUT move{};
-            move.type = INPUT_MOUSE;
-            move.mi.dwFlags = MOUSEEVENTF_MOVE;
-            SendInput(1, &move, sizeof(INPUT));
-            Sleep(6);
-            INPUT down{};
-            down.type = INPUT_MOUSE;
-            down.mi.dwFlags = MOUSEEVENTF_RIGHTDOWN;
-            SendInput(1, &down, sizeof(INPUT));
-            Sleep(10);
-            INPUT up{};
-            up.type = INPUT_MOUSE;
-            up.mi.dwFlags = MOUSEEVENTF_RIGHTUP;
-            SendInput(1, &up, sizeof(INPUT));
-            SetCursorPos(prevCursor.x, prevCursor.y);
-            // Move overflow back offscreen immediately after the click.
-            moveOverflowOffscreen(overflow);
-
-            trayRightClickStep = 2;
-            trayCaptureTries = 0;
-            microBurstCloakPopups(*this, 36);
-            if (SetTimer(hwnd, 10, 10, nullptr)) return;
-        }
 
         const bool capture = trayAction == TrayAction::RightClickMenu;
-        scanAndCloakNewPopups(*this);
+        adoptGuardDetectedMenu(*this);
+        fastScanAndCloakPopups(*this, true);
         if (!IsWindowVisible(trayCapturedMenuHwnd)) {
             trayCapturedMenuHwnd = nullptr;
             trayPopupSeenTries = 0;
@@ -3682,6 +4823,10 @@ void Dock::updateTraySync() {
                 if (!isWin32MenuClass(trayCapturedMenuHwnd) && trayPopupSeenTries == 4) {
                     const HWND emptyCandidate = trayCapturedMenuHwnd;
                     trayIgnoredPopups.push_back(emptyCandidate);
+                    {
+                        std::lock_guard lock(gGuardFilterMutex);
+                        gGuardIgnored.insert(emptyCandidate);
+                    }
                     if (HWND alt = findTriggeredTrayPopup(*this)) {
                         uncloakMenuWindow(emptyCandidate, false);
                         trayCapturedMenuHwnd = alt;
@@ -3689,41 +4834,63 @@ void Dock::updateTraySync() {
                         cloakMenuWindow(alt);
                     } else {
                         trayIgnoredPopups.pop_back();
+                        std::lock_guard lock(gGuardFilterMutex);
+                        gGuardIgnored.erase(emptyCandidate);
                     }
                 }
-                const int maxSeen = isWin32MenuClass(trayCapturedMenuHwnd) ? 12 : 28;
+                const int maxSeen = isWin32MenuClass(trayCapturedMenuHwnd) ? 10 : 20;
                 if (trayPopupSeenTries >= maxSeen) {
                     finishTrayMenu();
                     return;
                 }
             } else {
                 if (invokePopupMenuItem(trayCapturedMenuHwnd, trayPendingExec, trayMenuItems)) {
-                    trayRightClickStep = 4;
-                    if (SetTimer(hwnd, 10, 40, nullptr)) return;
-                } else if (trayPopupSeenTries >= (isWin32MenuClass(trayCapturedMenuHwnd) ? 12 : 24)) {
+                    finishTrayMenu(true);
+                    return;
+                } else if (trayPopupSeenTries >= (isWin32MenuClass(trayCapturedMenuHwnd) ? 8 : 16)) {
                     finishTrayMenu(false);
                     return;
                 }
             }
         }
 
-        // If offscreen VK_APPS didn't trigger a popup on a legacy tray app after ~95ms,
-        // fall back once to the clipped extreme-corner mouse right-click.
+        // Offscreen Shift+F10 retry (never moves overflow on-screen and never moves the user's cursor!)
         if (!trayCapturedMenuHwnd && trayUsedKeyboardMenu && !trayFallbackMouseSent &&
-            !trayActionOnTaskbar && trayCaptureTries >= 7 && overflow) {
+            !trayActionOnTaskbar && trayCaptureTries >= 4 && overflow) {
             trayFallbackMouseSent = true;
-            trayRightClickStep = 1;
-            trayRightClickPending = false;
-            if (SetTimer(hwnd, 10, 1, nullptr)) return;
+            moveOverflowOffscreen(overflow, false);
+            const auto retryBtns = collectOverflowButtons(overflow);
+            RECT retryRect{};
+            if (auto target = matchOverflowButton(retryBtns, trayActionName, trayActionIndex, retryRect)) {
+                triggerOffscreenContextMenu(*this, overflow, target.Get(), true);
+                adoptGuardDetectedMenu(*this);
+                if (trayCapturedMenuHwnd && IsWindowVisible(trayCapturedMenuHwnd)) {
+                    if (capture) {
+                        auto items = extractPopupMenuItems(trayCapturedMenuHwnd);
+                        if (!items.empty()) {
+                            trayLastPopupHwnd = trayCapturedMenuHwnd;
+                            trayMenuItems = std::move(items);
+                            finishTrayMenu();
+                            return;
+                        }
+                    } else if (invokePopupMenuItem(trayCapturedMenuHwnd, trayPendingExec, trayMenuItems)) {
+                        finishTrayMenu(true);
+                        return;
+                    }
+                }
+            }
         }
 
-        if (++trayCaptureTries < 50) {
-            if (!trayCapturedMenuHwnd && trayMenuOwnerPid && trayCaptureTries == 10) {
+        if (++trayCaptureTries < 28) {
+            if (!trayCapturedMenuHwnd && trayMenuOwnerPid && trayCaptureTries == 6 &&
+                trayActionIndex >= 0 && trayActionIndex < static_cast<int>(trayIcons.size())) {
                 const auto& item = trayIcons[trayActionIndex];
-                PostMessageW(item.targetHwnd, item.callbackMsg, MAKEWPARAM(trayNativeClick.x, trayNativeClick.y),
-                    MAKELPARAM(WM_CONTEXTMENU, item.uid));
+                if (item.targetHwnd && IsWindow(item.targetHwnd)) {
+                    PostMessageW(item.targetHwnd, item.callbackMsg, MAKEWPARAM(trayNativeClick.x, trayNativeClick.y),
+                        MAKELPARAM(WM_CONTEXTMENU, item.uid));
+                }
             }
-            if (SetTimer(hwnd, 10, 12, nullptr)) return;
+            if (SetTimer(hwnd, TraySyncTick, 10, nullptr)) return;
         }
         finishTrayMenu();
         return;
@@ -3733,15 +4900,15 @@ void Dock::updateTraySync() {
         ++trayCaptureTries;
         const HWND taskbar = FindWindowW(L"Shell_TrayWnd", nullptr);
         if (taskbar) {
-            if (!trayNeedsReveal && trayCaptureTries >= 2) {
+            if (!trayNeedsReveal && !IsWindowVisible(taskbar)) {
                 trayNeedsReveal = true;
+                gGuardHideTaskbar.store(true, std::memory_order_relaxed);
                 shellTaskbar.revealPrimary(true);
-                if (SetTimer(hwnd, 10, 20, nullptr)) return;
             }
-            if (trayCaptureTries == 3 || trayCaptureTries == 6) invokeTrayOverflow(taskbar, true);
-            else if (trayCaptureTries == 9) invokeViaWinB(taskbar);
+            if (trayCaptureTries == 2 || trayCaptureTries == 5) invokeTrayOverflow(taskbar, true);
+            else if (trayCaptureTries == 8) invokeViaWinB(taskbar);
         }
-        if (trayCaptureTries < 16 && SetTimer(hwnd, 10, 20, nullptr)) return;
+        if (trayCaptureTries < 14 && SetTimer(hwnd, TraySyncTick, 14, nullptr)) return;
         if (trayAction == TrayAction::Capture) {
             trayLoading = false;
             if (panel && page == SystemTray) paintSheet();
@@ -3751,32 +4918,16 @@ void Dock::updateTraySync() {
     }
 
     trayOverflow = overflow;
-    moveOverflowOffscreen(overflow);
+    moveOverflowOffscreen(overflow, false);
     if (trayNeedsReveal) {
         if (const HWND tb = FindWindowW(L"Shell_TrayWnd", nullptr); tb && IsWindowVisible(tb))
             ShowWindowAsync(tb, SW_HIDE);
     }
 
-    if (trayAction == TrayAction::Capture) {
-        RECT curOvRect{};
-        if (GetWindowRect(overflow, &curOvRect)) {
-            if (!trayOverflowSettled) {
-                trayOverflowSettled = true;
-                trayLastOvRect = curOvRect;
-                if (SetTimer(hwnd, 10, 65, nullptr)) return;
-            }
-            if (!EqualRect(&curOvRect, &trayLastOvRect) && trayCaptureTries < 6) {
-                trayLastOvRect = curOvRect;
-                ++trayCaptureTries;
-                if (SetTimer(hwnd, 10, 25, nullptr)) return;
-            }
-        }
-    }
-
     const auto buttons = collectOverflowButtons(overflow);
     if (buttons.empty()) {
-        if (++trayCaptureTries < 16 && SetTimer(hwnd, 10, 20, nullptr)) return;
-        PostMessageW(overflow, WM_CLOSE, 0, 0);
+        if (++trayCaptureTries < 14 && SetTimer(hwnd, TraySyncTick, 14, nullptr)) return;
+        dismissOverflowWindow(overflow, panel);
         if (trayAction == TrayAction::Capture) {
             trayLoading = false;
             if (panel && page == SystemTray) paintSheet();
@@ -3787,17 +4938,17 @@ void Dock::updateTraySync() {
 
     if (trayAction == TrayAction::Capture) {
         std::vector<std::shared_ptr<Gdiplus::Bitmap>> bitmaps;
-        const bool gotPixels = captureOverflowIcons(overflow, buttons, bitmaps);
-        if (!gotPixels && trayCaptureTries < 8) {
-            ++trayCaptureTries;
-            if (SetTimer(hwnd, 10, 25, nullptr)) return;
-        }
-        const auto regEntries = loadNotifyIconRegistry();
+        captureOverflowIcons(overflow, buttons, bitmaps);
+        const auto regEntries = cachedNotifyIconRegistry(false);
         std::vector<TrayItem> next;
         next.reserve(buttons.size());
         for (size_t i = 0; i < buttons.size(); ++i) {
             auto captured = (i < bitmaps.size()) ? bitmaps[i] : nullptr;
-            auto icon = resolveCrispTrayIcon(buttons[i].name, appIcon, regEntries, captured);
+            auto icon = lookupCachedTrayIcon(buttons[i].name);
+            if (!icon) {
+                icon = resolveCrispTrayIcon(buttons[i].name, appIcon, regEntries, captured);
+                storeCachedTrayIcon(buttons[i].name, icon);
+            }
             next.push_back({buttons[i].name, std::move(icon), nullptr, 0, 0, false});
         }
         if (const HWND tb = FindWindowW(L"Shell_TrayWnd", nullptr)) {
@@ -3807,14 +4958,18 @@ void Dock::updateTraySync() {
                     return toLowerText(e.name.c_str()) == pLow;
                 });
                 if (!dup) {
-                    auto icon = resolveCrispTrayIcon(pBtn.name, appIcon, regEntries, nullptr);
+                    auto icon = lookupCachedTrayIcon(pBtn.name);
+                    if (!icon) {
+                        icon = resolveCrispTrayIcon(pBtn.name, appIcon, regEntries, nullptr);
+                        storeCachedTrayIcon(pBtn.name, icon);
+                    }
                     next.push_back({pBtn.name, std::move(icon), nullptr, 0, 0, true});
                 }
             }
         }
         trayIcons = std::move(next);
         trayLoading = false;
-        PostMessageW(overflow, WM_CLOSE, 0, 0);
+        dismissOverflowWindow(overflow, panel);
         stopTraySync();
         if (panel && page == SystemTray) {
             positionSheet();
@@ -3825,11 +4980,11 @@ void Dock::updateTraySync() {
 
     RECT btnRect{};
     ComPtr<IUIAutomationElement> target = matchOverflowButton(buttons, trayActionName, trayActionIndex, btnRect);
-    if (!target) {
-        // Check scrolled overflow rows if the icon wasn't in the initial viewport.
+    if (!target && buttons.size() >= 12) {
         if (auto scroller = findOverflowVerticalScroller(sharedUia(), overflow)) {
+            ScopedHighResTimer hiRes;
             scroller->SetScrollPercent(UIA_ScrollPatternNoScroll, 0.0);
-            Sleep(20);
+            Sleep(12);
             for (int step = 0; step < 8 && !target; ++step) {
                 auto pageBtns = collectOverflowButtons(overflow);
                 target = matchOverflowButton(pageBtns, trayActionName, -1, btnRect);
@@ -3839,25 +4994,25 @@ void Dock::updateTraySync() {
                 if (FAILED(scroller->Scroll(ScrollAmount_NoAmount, ScrollAmount_LargeIncrement))) {
                     scroller->SetScrollPercent(UIA_ScrollPatternNoScroll, std::min(100.0, curPct + 35.0));
                 }
-                Sleep(25);
+                Sleep(14);
             }
         }
     }
     if (!target) {
-        PostMessageW(overflow, WM_CLOSE, 0, 0);
+        dismissOverflowWindow(overflow, panel);
         finishTrayMenu();
         return;
     }
 
     if (trayAction == TrayAction::LeftClick) {
         tryInvoke(target.Get());
-        PostMessageW(overflow, WM_CLOSE, 0, 0);
+        dismissOverflowWindow(overflow, nullptr);
         stopTraySync();
         return;
     }
 
-    // RightClickMenu / ExecuteMenu — Phase 1: keep overflow 100% OFFSCREEN and trigger the context
-    // menu via keyboard accessibility (SetFocus + VK_APPS), then sub-frame cloak any popup immediately.
+    // RightClickMenu / ExecuteMenu — Keep overflow 100% offscreen, lock cursor at traySavedCursor via ClipCursor,
+    // verify keyboard focus on target icon, trigger context menu via VK_APPS, cloak in <1ms, and extract/execute.
     RECT ovRect{};
     if (GetWindowRect(overflow, &ovRect)) {
         trayLocalOffset = {
@@ -3865,7 +5020,7 @@ void Dock::updateTraySync() {
             (btnRect.top + btnRect.bottom) / 2 - ovRect.top
         };
     }
-    moveOverflowOffscreen(overflow);
+    moveOverflowOffscreen(overflow, false);
 
     snapshotTrayPreWindows(*this);
     trayRightClickPending = true;
@@ -3882,13 +5037,27 @@ void Dock::updateTraySync() {
         SetWindowLongPtrW(panel, GWL_EXSTYLE, pex | WS_EX_TRANSPARENT);
     }
 
-    SetForegroundWindow(overflow);
-    target->SetFocus();
-    Sleep(10);
-    sendContextMenuKey();
-    microBurstCloakPopups(*this, 36);
+    triggerOffscreenContextMenu(*this, overflow, target.Get(), false);
+    adoptGuardDetectedMenu(*this);
 
-    if (!SetTimer(hwnd, 10, 10, nullptr)) {
+    if (trayCapturedMenuHwnd && IsWindowVisible(trayCapturedMenuHwnd)) {
+        if (trayAction == TrayAction::RightClickMenu) {
+            auto items = extractPopupMenuItems(trayCapturedMenuHwnd);
+            if (!items.empty()) {
+                trayLastPopupHwnd = trayCapturedMenuHwnd;
+                trayMenuItems = std::move(items);
+                finishTrayMenu();
+                return;
+            }
+        } else if (trayAction == TrayAction::ExecuteMenu) {
+            if (invokePopupMenuItem(trayCapturedMenuHwnd, trayPendingExec, trayMenuItems)) {
+                finishTrayMenu(true);
+                return;
+            }
+        }
+    }
+
+    if (!SetTimer(hwnd, TraySyncTick, 10, nullptr)) {
         finishTrayMenu();
     }
 }

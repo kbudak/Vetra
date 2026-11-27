@@ -11,9 +11,87 @@ constexpr float CardWidth = 216.f, CardHeight = 158.f, CardGap = 8.f;
 constexpr float SidePadding = 16.f, CardTop = 14.f, BottomPadding = 16.f;
 constexpr float NavigationHeight = 31.f;
 constexpr int MaxVisibleCards = 4;
+constexpr wchar_t ThumbHostClass[] = L"VetraDwmThumbHost";
 
 std::mutex gPreviewCacheMutex;
 std::unordered_map<HWND, std::shared_ptr<Gdiplus::Bitmap>> gPreviewCache;
+
+struct PreviewOverlaySpec {
+    HWND source{};
+    Box frameDip{};
+};
+
+struct DwmThumbSlot {
+    HWND host{};
+    HWND owner{};
+    HWND source{};
+    HTHUMBNAIL thumb{};
+    RECT lastRect{};
+    BYTE lastAlpha = 0;
+    bool visible = false;
+    bool dwmOk = false;
+};
+
+std::vector<PreviewOverlaySpec> gOverlaySpecs;
+std::vector<DwmThumbSlot> gThumbSlots;
+
+LRESULT CALLBACK thumbHostProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_NCHITTEST: return HTTRANSPARENT;
+    case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
+    case WM_ERASEBKGND: return 1;
+    case WM_PAINT: {
+        PAINTSTRUCT ps{};
+        BeginPaint(w, &ps);
+        EndPaint(w, &ps);
+        return 0;
+    }
+    default: return DefWindowProcW(w, msg, wp, lp);
+    }
+}
+
+void ensureThumbHostClass() {
+    static bool registered = false;
+    if (registered) return;
+    WNDCLASSEXW wc{sizeof(wc)};
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpfnWndProc = thumbHostProc;
+    wc.lpszClassName = ThumbHostClass;
+    if (RegisterClassExW(&wc) || GetLastError() == ERROR_CLASS_ALREADY_EXISTS) registered = true;
+}
+
+bool isPreviewOverlayWindow(HWND hwnd) {
+    if (!hwnd) return false;
+    for (const auto& slot : gThumbSlots) {
+        if (slot.host == hwnd) return true;
+    }
+    return false;
+}
+
+bool hasActiveDwmThumb(HWND source) {
+    if (!source) return false;
+    for (const auto& slot : gThumbSlots) {
+        if (slot.source == source && slot.dwmOk && slot.thumb) return true;
+    }
+    return false;
+}
+
+void destroyThumbSlot(DwmThumbSlot& slot) {
+    if (slot.thumb) {
+        DwmUnregisterThumbnail(slot.thumb);
+        slot.thumb = nullptr;
+    }
+    if (slot.host) {
+        DestroyWindow(slot.host);
+        slot.host = nullptr;
+    }
+    slot.owner = nullptr;
+    slot.source = nullptr;
+    slot.lastRect = {};
+    slot.lastAlpha = 0;
+    slot.visible = false;
+    slot.dwmOk = false;
+}
 
 std::shared_ptr<Gdiplus::Bitmap> lookupPreviewCache(HWND window) {
     std::lock_guard lock(gPreviewCacheMutex);
@@ -112,6 +190,131 @@ std::shared_ptr<Gdiplus::Bitmap> captureWindowPreview(HWND window) {
 }
 }
 
+void Dock::clearWindowPreviewOverlays() {
+    gOverlaySpecs.clear();
+    for (auto& slot : gThumbSlots) destroyThumbSlot(slot);
+    gThumbSlots.clear();
+}
+
+void Dock::syncWindowPreviewOverlays(const POINT* origin) {
+    if (!panel || page != ChromeWindows || gOverlaySpecs.empty()) {
+        for (auto& slot : gThumbSlots) {
+            if (slot.host && slot.visible) {
+                ShowWindow(slot.host, SW_HIDE);
+                slot.visible = false;
+            }
+        }
+        return;
+    }
+
+    const bool panelVisible = IsWindowVisible(panel) != FALSE;
+    const BYTE alpha = sheet.d.layerOpacity;
+    if (!panelVisible || alpha == 0) {
+        for (auto& slot : gThumbSlots) {
+            if (slot.host && slot.visible) {
+                ShowWindow(slot.host, SW_HIDE);
+                slot.visible = false;
+            }
+        }
+        return;
+    }
+
+    POINT panelOrg{};
+    if (origin) {
+        panelOrg = *origin;
+    } else {
+        RECT pr{};
+        if (!GetWindowRect(panel, &pr)) return;
+        panelOrg = {pr.left, pr.top};
+    }
+
+    ensureThumbHostClass();
+    while (gThumbSlots.size() > gOverlaySpecs.size()) {
+        destroyThumbSlot(gThumbSlots.back());
+        gThumbSlots.pop_back();
+    }
+    if (gThumbSlots.size() < gOverlaySpecs.size()) gThumbSlots.resize(gOverlaySpecs.size());
+
+    for (size_t i = 0; i < gOverlaySpecs.size(); ++i) {
+        const auto& spec = gOverlaySpecs[i];
+        auto& slot = gThumbSlots[i];
+
+        if (!spec.source || !IsWindow(spec.source)) {
+            if (slot.host && slot.visible) { ShowWindow(slot.host, SW_HIDE); slot.visible = false; }
+            slot.dwmOk = false;
+            continue;
+        }
+
+        if (!slot.host || slot.owner != panel) {
+            destroyThumbSlot(slot);
+            const DWORD exStyle = WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT | WS_EX_LAYERED |
+                (model.topmost ? WS_EX_TOPMOST : 0);
+            slot.host = CreateWindowExW(exStyle, ThumbHostClass, L"", WS_POPUP,
+                panelOrg.x, panelOrg.y, 1, 1, panel, nullptr, GetModuleHandleW(nullptr), nullptr);
+            if (!slot.host) continue;
+            slot.owner = panel;
+            SetLayeredWindowAttributes(slot.host, 0, alpha, LWA_ALPHA);
+            slot.lastAlpha = alpha;
+            constexpr DWORD kCornerAttr = 33; // DWMWA_WINDOW_CORNER_PREFERENCE
+            const DWORD cornerPref = 3;       // DWMWCP_ROUNDSMALL
+            DwmSetWindowAttribute(slot.host, kCornerAttr, &cornerPref, sizeof(cornerPref));
+        }
+
+        if (slot.source != spec.source || !slot.thumb) {
+            if (slot.thumb) {
+                DwmUnregisterThumbnail(slot.thumb);
+                slot.thumb = nullptr;
+            }
+            slot.source = spec.source;
+            slot.dwmOk = false;
+            if (SUCCEEDED(DwmRegisterThumbnail(slot.host, spec.source, &slot.thumb)) && slot.thumb) {
+                slot.dwmOk = true;
+            }
+        }
+
+        SIZE srcSize{};
+        if (!slot.dwmOk || !slot.thumb || FAILED(DwmQueryThumbnailSourceSize(slot.thumb, &srcSize)) ||
+            srcSize.cx <= 0 || srcSize.cy <= 0) {
+            slot.dwmOk = false;
+            if (slot.visible) { ShowWindow(slot.host, SW_HIDE); slot.visible = false; }
+            continue;
+        }
+
+        const float pad = 3.f;
+        const float maxW = std::max(8.f, (width(spec.frameDip) - pad * 2.f) * sheet.scale);
+        const float maxH = std::max(8.f, (height(spec.frameDip) - pad * 2.f) * sheet.scale);
+        const float fit = std::min(maxW / static_cast<float>(srcSize.cx), maxH / static_cast<float>(srcSize.cy));
+        const int tw = std::max(1, static_cast<int>(std::lround(srcSize.cx * fit)));
+        const int th = std::max(1, static_cast<int>(std::lround(srcSize.cy * fit)));
+        const float fx = panelOrg.x + (spec.frameDip.left + pad) * sheet.scale;
+        const float fy = panelOrg.y + (spec.frameDip.top + pad) * sheet.scale;
+        const int tx = static_cast<int>(std::lround(fx + (maxW - tw) * .5f));
+        const int ty = static_cast<int>(std::lround(fy + (maxH - th) * .5f));
+        const RECT targetRect{tx, ty, tx + tw, ty + th};
+
+        if (slot.lastAlpha != alpha) {
+            SetLayeredWindowAttributes(slot.host, 0, alpha, LWA_ALPHA);
+            slot.lastAlpha = alpha;
+        }
+
+        const bool rectChanged = !EqualRect(&slot.lastRect, &targetRect);
+        if (rectChanged || !slot.visible) {
+            SetWindowPos(slot.host, model.topmost ? HWND_TOPMOST : HWND_TOP, tx, ty, tw, th,
+                SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW);
+            slot.lastRect = targetRect;
+            slot.visible = true;
+        }
+
+        DWM_THUMBNAIL_PROPERTIES props{};
+        props.dwFlags = DWM_TNP_RECTDESTINATION | DWM_TNP_VISIBLE | DWM_TNP_OPACITY | DWM_TNP_SOURCECLIENTAREAONLY;
+        props.rcDestination = {0, 0, tw, th};
+        props.opacity = 255;
+        props.fVisible = TRUE;
+        props.fSourceClientAreaOnly = FALSE;
+        DwmUpdateThumbnailProperties(slot.thumb, &props);
+    }
+}
+
 void Dock::rememberChromeWindow(HWND window) {
     if (std::find(chromeWindowOrder.begin(), chromeWindowOrder.end(), window) == chromeWindowOrder.end())
         chromeWindowOrder.push_back(window);
@@ -129,10 +332,12 @@ bool Dock::syncChromeWindows(bool renew) {
         }
     };
 
+    bool isPinnedChrome = false;
     if (previewTarget.kind == OrderKind::Shortcut) {
         if (previewTarget.index >= 0 && static_cast<size_t>(previewTarget.index) < model.shortcuts.size()) {
             const auto& app = model.shortcuts[static_cast<size_t>(previewTarget.index)];
-            if (isChromeApp(app)) {
+            isPinnedChrome = isChromeApp(app);
+            if (isPinnedChrome) {
                 pushChromeGroup();
             } else {
                 for (const auto& item : extra.windows) {
@@ -145,8 +350,12 @@ bool Dock::syncChromeWindows(bool renew) {
         const auto found = std::find_if(extra.windows.begin(), extra.windows.end(),
             [&](const OpenWindow& item) { return item.handle == previewTarget.window; });
         if (found != extra.windows.end() && IsWindow(found->handle)) {
-            if (isChromeApp(found->app)) pushChromeGroup();
-            else matched.push_back(&*found);
+            if (isChromeApp(found->app)) {
+                isPinnedChrome = true;
+                pushChromeGroup();
+            } else {
+                matched.push_back(&*found);
+            }
         }
     }
 
@@ -161,11 +370,21 @@ bool Dock::syncChromeWindows(bool renew) {
         const bool hasCache = cached != chromeWindows.end();
         std::shared_ptr<Gdiplus::Bitmap> bmp = hasCache ? cached->preview : nullptr;
         if (!bmp) bmp = lookupPreviewCache(item.handle);
-        std::shared_ptr<Gdiplus::Bitmap> icon = item.icon;
+
+        // For pinned non-Chrome apps (like Netflix/Outlook/Explorer), prefer the crisp dock icon
+        // so dark/empty UWP frame icons never render blank in the preview header.
+        std::shared_ptr<Gdiplus::Bitmap> icon;
+        if (!isPinnedChrome && previewTarget.kind == OrderKind::Shortcut &&
+            previewTarget.index >= 0 && static_cast<size_t>(previewTarget.index) < appImages.size() &&
+            appImages[static_cast<size_t>(previewTarget.index)]) {
+            icon = appImages[static_cast<size_t>(previewTarget.index)];
+        }
+        if (!icon) icon = item.icon;
         if (!icon && previewTarget.kind == OrderKind::Shortcut &&
             previewTarget.index >= 0 && static_cast<size_t>(previewTarget.index) < appImages.size()) {
             icon = appImages[static_cast<size_t>(previewTarget.index)];
         }
+
         current.push_back({item.handle, item.title, item.active, minimized,
             !renew && hasCache && cached->minimized == minimized && cached->requested,
             std::move(icon), std::move(bmp)});
@@ -293,7 +512,7 @@ void Dock::updateChromeHover() {
         return;
     }
     if (showing) {
-        if (overIcon || hovered == panel) chromeLeftAt = 0;
+        if (overIcon || hovered == panel || isPreviewOverlayWindow(hovered)) chromeLeftAt = 0;
         else if (!chromeLeftAt) chromeLeftAt = stamp;
         else if (stamp - chromeLeftAt >= closeDelay) close();
     } else if (!overIcon || (panel && page != ChromeWindows)) {
@@ -335,7 +554,8 @@ void Dock::updateChromePreviews() {
             const int end = std::min(static_cast<int>(chromeWindows.size()), listOffset + visibleCards(sheet.w));
             for (int i = listOffset; i < end; ++i) {
                 auto& card = chromeWindows[i];
-                if (card.requested || card.minimized) continue;
+                // Skip CPU PrintWindow capture whenever DWM live thumbnail is already presenting this window!
+                if (card.requested || card.minimized || hasActiveDwmThumb(card.window)) continue;
                 card.requested = true;
                 targets.push_back({card.window, card.title});
             }
@@ -370,6 +590,7 @@ void Dock::scrollChromeWindows(int delta) {
 
 void Dock::chromeWindowsPanel(Palette p) {
     auto& d = sheet.d;
+    gOverlaySpecs.clear();
     const int count = static_cast<int>(chromeWindows.size());
     if (!count) return;
     const int visible = visibleCards(sheet.w);
@@ -389,13 +610,14 @@ void Dock::chromeWindowsPanel(Palette p) {
         const float hot = sheet.hoverAmount();
         const float down = sheet.pressAmount();
         const bool overCard = sheet.hover == cardHitIdx || sheet.hover == cardHitIdx + 1;
+        const float s = 1.f + 0.012f * hot - 0.025f * down;
+        const float lift = -2.f * hot;
+        const float cxCard = x + CardWidth / 2.f, cyCard = CardTop + CardHeight / 2.f;
         D2D1::Matrix3x2F cp{};
         const bool xform = hot > 0.01f || down > 0.01f;
         if (xform) {
             d.target->GetTransform(&cp);
-            const float s = 1.f + 0.012f * hot - 0.025f * down;
-            const float lift = -2.f * hot;
-            d.target->SetTransform(D2D1::Matrix3x2F::Scale(s, s, {x + CardWidth / 2.f, CardTop + CardHeight / 2.f}) *
+            d.target->SetTransform(D2D1::Matrix3x2F::Scale(s, s, {cxCard, cyCard}) *
                 D2D1::Matrix3x2F::Translation(0.f, lift) * cp);
         }
         if (p.glass) {
@@ -415,22 +637,33 @@ void Dock::chromeWindowsPanel(Palette p) {
 
         const auto frame = box(x + 10, CardTop + 37, CardWidth - 20, CardHeight - 47);
         d.fill(frame, 6, tint(p.base));
-        if (item.preview) {
-            const float w = static_cast<float>(item.preview->GetWidth());
-            const float h = static_cast<float>(item.preview->GetHeight());
-            const float scale = std::min((width(frame) - 6) / w, (height(frame) - 6) / h);
-            d.image(item.preview, box(frame.left + (width(frame) - w * scale) / 2,
-                frame.top + (height(frame) - h * scale) / 2, w * scale, h * scale));
-        } else if (item.icon) {
-            const float sz = 36.f;
-            const float iy = frame.top + (height(frame) - (item.minimized ? sz + 18.f : sz)) / 2.f;
-            d.image(item.icon, d.snap(box(frame.left + (width(frame) - sz) / 2.f, iy, sz, sz)), p.light);
-            if (item.minimized) {
-                d.text(L"Küçültüldü", box(frame.left + 8, iy + sz + 4, width(frame) - 16, 16), Micro, tint(p.muted), Center);
+
+        // Record transformed frame bounds for live GPU DWM thumbnail overlay (works even when minimized!)
+        Box transformedFrame = frame;
+        if (xform) {
+            transformedFrame.left   = cxCard + (frame.left - cxCard) * s;
+            transformedFrame.right  = cxCard + (frame.right - cxCard) * s;
+            transformedFrame.top    = cyCard + (frame.top - cyCard) * s + lift;
+            transformedFrame.bottom = cyCard + (frame.bottom - cyCard) * s + lift;
+        }
+        gOverlaySpecs.push_back({item.window, transformedFrame});
+
+        // Draw fallback only if DWM thumbnail isn't active for this window
+        if (!hasActiveDwmThumb(item.window)) {
+            if (item.preview) {
+                const float w = static_cast<float>(item.preview->GetWidth());
+                const float h = static_cast<float>(item.preview->GetHeight());
+                const float scale = std::min((width(frame) - 6) / w, (height(frame) - 6) / h);
+                d.image(item.preview, box(frame.left + (width(frame) - w * scale) / 2,
+                    frame.top + (height(frame) - h * scale) / 2, w * scale, h * scale));
+            } else if (item.icon) {
+                const float sz = 34.f;
+                d.image(item.icon, d.snap(box(frame.left + (width(frame) - sz) / 2.f,
+                    frame.top + (height(frame) - sz) / 2.f, sz, sz)), p.light);
+            } else {
+                d.icon(ScreenIcon, box(frame.left + (width(frame) - 28) / 2,
+                    frame.top + (height(frame) - 28) / 2, 28, 28), tint(p.muted, .70f));
             }
-        } else {
-            d.icon(ScreenIcon, box(frame.left + (width(frame) - 28) / 2,
-                frame.top + (height(frame) - 28) / 2, 28, 28), tint(p.muted, .70f));
         }
         if (xform) d.target->SetTransform(cp);
 

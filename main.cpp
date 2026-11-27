@@ -254,7 +254,10 @@ void Dock::animateFrame() {
         }
     }
     if (sheetFrame) paintSheet(sheetOrigin ? &*sheetOrigin : nullptr);
-    else if (sheetOrigin) sheet.d.present(&*sheetOrigin);
+    else if (sheetOrigin) {
+        sheet.d.present(&*sheetOrigin);
+        if (panel && page == ChromeWindows) syncWindowPreviewOverlays(&*sheetOrigin);
+    }
 
     if (pendingPosition && !dockVisSpring.active(0.001f, 0.006f) && !dockDragging && !dockOrderDragging) {
         pendingPosition = false;
@@ -1168,7 +1171,7 @@ void Dock::positionSheet(bool reopening) {
     }
     if (page == SystemTray) {
         if (trayMenuIconIndex >= 0) {
-            sheet.w = 276.f;
+            sheet.w = trayMenuSheetWidth();
             if (trayMenuLoading) {
                 sheet.h = 104.f;
             } else {
@@ -1355,6 +1358,8 @@ void Dock::open(int id, float x, bool focus) {
     openingSheet = true;
     positionSheet(reopening);
     ShowWindow(panel, SW_SHOWNOACTIVATE);
+    if (page == ChromeWindows) syncWindowPreviewOverlays();
+    else clearWindowPreviewOverlays();
     if (focus) SetForegroundWindow(panel);
     openingSheet = false;
     updateVisibilityTimer();
@@ -1386,6 +1391,7 @@ void Dock::close() {
 }
 
 void Dock::closeSheet(bool redrawBar) {
+    clearWindowPreviewOverlays();
     if (!panel) return;
     if (page == SystemTray && trayAction != TrayAction::LeftClick && trayAction != TrayAction::ExecuteMenu && trayBusy()) stopTraySync();
     sheetClosing = false;
@@ -2931,7 +2937,11 @@ LRESULT Dock::message(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             prewarmTrayCaches();
             if (const auto stop = extra.proStop) {
                 std::thread([stop] {
-                    SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
+                    struct BgPriGuard {
+                        bool active = false;
+                        BgPriGuard() noexcept { active = (SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN) != FALSE); }
+                        ~BgPriGuard() { if (active) SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END); }
+                    } bgGuard;
                     if (stop->load()) return;
                     const HRESULT comHr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
                     if (SUCCEEDED(comHr) || comHr == RPC_E_CHANGED_MODE) {
@@ -2971,9 +2981,9 @@ LRESULT Dock::message(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             }
         }
         if (isOwner && wp == 8) updateNativeFlyout();
-        if (isOwner && wp == 10) updateTraySync();
+        if (isOwner && wp == TraySyncTick) updateTraySync();
         if (isOwner && wp == 11) finishCapture();
-        if (isOwner && wp == 12) pollDeferredTrayUncloak();
+        if (isOwner && wp == TrayUncloakTick) pollDeferredTrayUncloak();
         if (isOwner && wp == AnimationTick && animTimerActive && !animationTimer) animateFrame();
         if (isOwner && wp == 4) {
             if (!dockEditMode) { KillTimer(hwnd, 4); return 0; }
@@ -3015,7 +3025,7 @@ LRESULT Dock::message(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             stopWindowHook();
             KillTimer(hwnd, WindowSyncTick);
             KillTimer(hwnd, WarmupTick);
-            stopTraySync(true); KillTimer(hwnd, 10); KillTimer(hwnd, 12); closeSheet(); shellTaskbar.restore(); KillTimer(hwnd, 8); tray(false); KillTimer(hwnd, 1); KillTimer(hwnd, 3); KillTimer(hwnd, 4); releaseAudioEndpoint(); PostQuitMessage(0);
+            stopTraySync(true); KillTimer(hwnd, TraySyncTick); KillTimer(hwnd, TrayUncloakTick); closeSheet(); shellTaskbar.restore(); KillTimer(hwnd, 8); tray(false); KillTimer(hwnd, 1); KillTimer(hwnd, 3); KillTimer(hwnd, 4); releaseAudioEndpoint(); PostQuitMessage(0);
         }
         return 0;
     }

@@ -1206,6 +1206,11 @@ void Dock::sampleKeyboardLayout() {
     if (!current) current = GetKeyboardLayout(0);
 
     const int count = GetKeyboardLayoutList(0, nullptr);
+    if (current && current == extra.activeKeyboardHkl && count > 0 &&
+        static_cast<size_t>(count) == extra.keyboardLayouts.size() &&
+        !extra.keyboardShort.empty() && page != KeyboardLang) {
+        return;
+    }
     std::vector<HKL> rawList(count > 0 ? count : 0);
     if (count > 0) GetKeyboardLayoutList(count, rawList.data());
     if (current && std::find(rawList.begin(), rawList.end(), current) == rawList.end())

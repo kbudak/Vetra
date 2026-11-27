@@ -738,13 +738,15 @@ void readLocalCodex(AiPlanLive& out) {
 
 // ---------- 3A. Local Claude Desktop plan-usage-history.json reader (mtime-cached, 5h & 7d live %) ----------
 fs::path findNewestClaudeDesktopUsageFile(fs::file_time_type& outMtime) {
-    std::error_code ec;
     fs::path best;
     fs::file_time_type bestMtime{};
     auto consider = [&](const fs::path& candidate) {
-        if (!fs::is_regular_file(candidate, ec)) return;
-        const auto mt = fs::last_write_time(candidate, ec);
-        if (ec) return;
+        std::error_code cec;
+        if (!fs::is_regular_file(candidate, cec) || cec) return;
+        const auto sz = fs::file_size(candidate, cec);
+        if (cec || sz == 0) return;
+        const auto mt = fs::last_write_time(candidate, cec);
+        if (cec) return;
         if (best.empty() || mt > bestMtime) {
             best = candidate;
             bestMtime = mt;
@@ -755,14 +757,34 @@ fs::path findNewestClaudeDesktopUsageFile(fs::file_time_type& outMtime) {
         consider(fs::path(roaming) / L"Claude" / L"plan-usage-history.json");
     const Text local = envDir(L"LOCALAPPDATA");
     if (!local.empty()) {
+        consider(fs::path(local) / L"Claude" / L"plan-usage-history.json");
+
+        // Current Windows Claude Desktop data directory (%LOCALAPPDATA%\Claude-Data\<profile>\plan-usage-history.json)
+        const fs::path claudeData = fs::path(local) / L"Claude-Data";
+        std::error_code dec;
+        if (fs::is_directory(claudeData, dec) && !dec) {
+            consider(claudeData / L"plan-usage-history.json");
+            for (auto it = fs::directory_iterator(claudeData, fs::directory_options::skip_permission_denied, dec);
+                 !dec && it != fs::directory_iterator(); it.increment(dec)) {
+                std::error_code iec;
+                if (!it->is_directory(iec) || iec) continue;
+                consider(it->path() / L"plan-usage-history.json");
+            }
+        }
+
+        // Legacy MSIX package LocalCache paths
         const fs::path pkgs = fs::path(local) / L"Packages";
-        if (fs::is_directory(pkgs, ec)) {
-            for (auto it = fs::directory_iterator(pkgs, fs::directory_options::skip_permission_denied, ec);
-                 !ec && it != fs::directory_iterator(); it.increment(ec)) {
-                if (!it->is_directory(ec)) continue;
+        std::error_code pec;
+        if (fs::is_directory(pkgs, pec) && !pec) {
+            for (auto it = fs::directory_iterator(pkgs, fs::directory_options::skip_permission_denied, pec);
+                 !pec && it != fs::directory_iterator(); it.increment(pec)) {
+                std::error_code iec;
+                if (!it->is_directory(iec) || iec) continue;
                 const Text name = it->path().filename().wstring();
-                if (name.size() >= 7 && _wcsnicmp(name.c_str(), L"Claude_", 7) == 0)
+                if (name.size() >= 7 && _wcsnicmp(name.c_str(), L"Claude_", 7) == 0) {
                     consider(it->path() / L"LocalCache" / L"Roaming" / L"Claude" / L"plan-usage-history.json");
+                    consider(it->path() / L"LocalCache" / L"Local" / L"Claude" / L"plan-usage-history.json");
+                }
             }
         }
     }
@@ -783,7 +805,7 @@ void readLocalClaudeDesktop(AiPlanLive& out) {
     if (path.empty()) return;
     std::error_code ec;
     const auto fsz = fs::file_size(path, ec);
-    if (ec || fsz == 0 || fsz > 512 * 1024) return;
+    if (ec || fsz == 0 || fsz > 4 * 1024 * 1024) return;
 
     const time_t nowT = std::time(nullptr);
     {
@@ -890,7 +912,7 @@ AiPlanLive fetchClaudeOAuthUsage(std::shared_ptr<std::atomic<bool>> stop) {
         std::lock_guard lock(apiMu);
         if (hasRejectedMtime && rejectedMtime == mtime) return out;
         if (cooldownUntil && nowTick < cooldownUntil) return out;
-        cooldownUntil = nowTick + 30000ULL; // minimum 30s spacing even on manual refresh
+        cooldownUntil = nowTick + 15000ULL; // minimum 15s spacing even on manual refresh
     }
 
     auto markRejected = [&]() {
@@ -2280,12 +2302,13 @@ void Dock::sampleProWidgets(bool forceWeb) {
         } catch (const std::exception&) {}
     }
 
-    // Live Claude Code OAuth usage API refresh (every 5 min when visible, skips immediately if no valid OAuth token)
+    // Live Claude Code OAuth usage API refresh (60s when OAuth is active; 15s lightweight mtime check when idle)
     const bool needClaudeLive = forceWeb || triple || active(ClaudeUsage) || active(ClaudePlanUsage) ||
         (aiLimits && (model.aiLimitFirst == 0 || model.aiLimitSecond == 0));
     if (needClaudeLive && !extra.aiLive[0].fromFeedFile && !extra.claudeLiveRequest.valid() &&
         (forceWeb || !extra.claudeLiveAt || stamp >= extra.claudeLiveAt)) {
-        extra.claudeLiveAt = stamp + 300000;
+        const bool oauthActive = extra.aiLive[0].hasLimits && extra.aiLive[0].r1At > 0;
+        extra.claudeLiveAt = stamp + (oauthActive ? 60000ULL : 15000ULL);
         const HWND notify = hwnd;
         auto stop = extra.proStop;
         try {
